@@ -19,6 +19,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   private readonly INDEX_PREFIX = 'campaignIndex:';
   private readonly CAMPAIGN_IDS_INDEX_KEY = `${this.INDEX_PREFIX}ids`;
   private readonly CAMPAIGN_ACTIVE_INDEX_KEY = `${this.INDEX_PREFIX}active`;
+  private readonly CAMPAIGN_INDEX_BACKFILL_LOCK_KEY = `${this.INDEX_PREFIX}backfill:lock`;
 
   private readonly CAMPAIGN_CACHE_TTL = 60 * 60 * 24; // 밀리초 아닌 초 단위, 24시간
   private readonly ALL_CAMPAIGNS_CACHE_TTL_MS = 60_000; // RTB decision hot path (짧은 TTL로 Redis SCAN/JSON.GET 비용 완화)
@@ -363,6 +364,180 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
 
   private getCampaignCacheKey(id: string): string {
     return `${this.KEY_PREFIX}${id}`;
+  }
+
+  /**
+   * 기존 Redis에 이미 존재하는 `campaign:{id}` 키들을 기준으로 인덱스(Set)를 재구축합니다.
+   *
+   * - `campaignIndex:ids`: 전체 캠페인 id 집합
+   * - `campaignIndex:active`: status === 'ACTIVE' 인 캠페인 id 집합
+   *
+   * 주의:
+   * - 인덱스를 `DEL` 후 재적재하는 방식이므로, 운영 중에 실행할 경우 write path와 경합이 발생할 수 있습니다.
+   * - 되도록 “배포 직후 1회” 또는 “트래픽이 낮은 시간”에 실행하는 것을 권장합니다.
+   */
+  async rebuildCampaignIndicesFromRedisScan(options?: {
+    lockTtlSeconds?: number;
+    batchSize?: number;
+    scanCount?: number;
+  }): Promise<{
+    scannedKeys: number;
+    indexedIds: number;
+    activeIds: number;
+    durationMs: number;
+  }> {
+    const startedAtMs = Date.now();
+    const lockTtlSeconds = options?.lockTtlSeconds ?? 10 * 60;
+    const batchSize = options?.batchSize ?? 200;
+    const scanCount = options?.scanCount ?? 200;
+
+    const lockAcquired = await this.ioredisClient.set(
+      this.CAMPAIGN_INDEX_BACKFILL_LOCK_KEY,
+      String(startedAtMs),
+      'EX',
+      lockTtlSeconds,
+      'NX'
+    );
+
+    if (!lockAcquired) {
+      throw new Error(
+        `campaign index backfill lock 획득 실패: ${this.CAMPAIGN_INDEX_BACKFILL_LOCK_KEY}`
+      );
+    }
+
+    let scannedKeys = 0;
+    let indexedIds = 0;
+    let activeIds = 0;
+
+    try {
+      this.logger.log(
+        `[CampaignIndexBackfill] 시작 (batchSize=${batchSize}, scanCount=${scanCount})`
+      );
+
+      await this.ioredisClient.del(
+        this.CAMPAIGN_IDS_INDEX_KEY,
+        this.CAMPAIGN_ACTIVE_INDEX_KEY
+      );
+
+      const pattern = `${this.KEY_PREFIX}*`;
+      let cursor = '0';
+      const keys: string[] = [];
+
+      do {
+        const result = await this.ioredisClient.scan(
+          cursor,
+          'MATCH',
+          pattern,
+          'COUNT',
+          scanCount
+        );
+        cursor = result[0];
+        keys.push(...result[1]);
+      } while (cursor !== '0');
+
+      scannedKeys = keys.length;
+      this.logger.log(`[CampaignIndexBackfill] SCAN 완료: keys=${scannedKeys}`);
+
+      if (keys.length === 0) {
+        return {
+          scannedKeys,
+          indexedIds,
+          activeIds,
+          durationMs: Date.now() - startedAtMs,
+        };
+      }
+
+      for (let i = 0; i < keys.length; i += batchSize) {
+        const batchKeys = keys.slice(i, i + batchSize);
+        const pipeline = this.ioredisClient.pipeline();
+
+        for (const key of batchKeys) {
+          pipeline.call('JSON.GET', key, '$.status');
+        }
+
+        const results = await pipeline.exec();
+        if (!results) continue;
+
+        const idsChunk: string[] = [];
+        const activeIdsChunk: string[] = [];
+
+        results.forEach(([error, result], idx) => {
+          if (error) {
+            this.logger.warn(
+              `캠페인 status 조회 실패: ${batchKeys[idx]}`,
+              error
+            );
+            return;
+          }
+
+          const key = batchKeys[idx];
+          const id = key.startsWith(this.KEY_PREFIX)
+            ? key.slice(this.KEY_PREFIX.length)
+            : '';
+
+          // 예상하지 못한 서브키(예: campaign:foo:bar) 방지
+          if (!id || id.includes(':')) return;
+
+          idsChunk.push(id);
+
+          if (typeof result !== 'string') return;
+
+          try {
+            // RedisJSON path 조회는 배열 형태로 반환됩니다. 예: ["ACTIVE"]
+            const parsed = JSON.parse(result) as unknown;
+            const status =
+              Array.isArray(parsed) && typeof parsed[0] === 'string'
+                ? parsed[0]
+                : null;
+            if (status === 'ACTIVE') {
+              activeIdsChunk.push(id);
+            }
+          } catch (parseError) {
+            this.logger.warn(
+              `캠페인 status JSON 파싱 실패: ${key}`,
+              parseError
+            );
+          }
+        });
+
+        if (idsChunk.length > 0) {
+          await this.ioredisClient.sadd(
+            this.CAMPAIGN_IDS_INDEX_KEY,
+            ...idsChunk
+          );
+          indexedIds += idsChunk.length;
+        }
+
+        if (activeIdsChunk.length > 0) {
+          await this.ioredisClient.sadd(
+            this.CAMPAIGN_ACTIVE_INDEX_KEY,
+            ...activeIdsChunk
+          );
+          activeIds += activeIdsChunk.length;
+        }
+      }
+
+      this.logger.log(
+        `[CampaignIndexBackfill] 완료: indexed=${indexedIds}, active=${activeIds}, duration=${Date.now() - startedAtMs}ms`
+      );
+
+      return {
+        scannedKeys,
+        indexedIds,
+        activeIds,
+        durationMs: Date.now() - startedAtMs,
+      };
+    } finally {
+      // best-effort lock 해제
+      try {
+        await this.ioredisClient.del(this.CAMPAIGN_INDEX_BACKFILL_LOCK_KEY);
+      } catch (error) {
+        this.logger.warn(
+          `campaign index backfill lock 해제 실패: ${this.CAMPAIGN_INDEX_BACKFILL_LOCK_KEY}`,
+          error
+        );
+      }
+    }
   }
 
   private async bestEffortUpdateCampaignIndices(
