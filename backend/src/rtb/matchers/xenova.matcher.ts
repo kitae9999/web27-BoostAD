@@ -56,7 +56,7 @@ export class TransformerMatcher extends Matcher {
     // Redis에서 모든 캠페인 조회 (캐시 우선 전략)
     const allCampaigns = await this.campaignCacheRepo.getAllCampaigns();
 
-    // 비딩 자격 필터링: ACTIVE + 날짜 범위 + deletedAt + embeddingTags + isHighIntent 존재
+    // 비딩 자격 필터링: ACTIVE + 날짜 범위 + deletedAt + embeddingTags + isHighIntent 존재, budget으로 거르는 부분 아님
     const eligibleCampaigns = this.filterEligibleCampaigns(
       allCampaigns,
       context.isHighIntent

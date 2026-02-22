@@ -15,7 +15,12 @@ import {
 export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   private readonly logger = new Logger(RedisCampaignCacheRepository.name);
   private readonly KEY_PREFIX = 'campaign:';
-  private readonly CAMPAIGN_CACHE_TTL = 60 * 60 * 24;
+  // 인덱스 키가 `campaign:*` 스캔(getAllCampaigns)에 섞이지 않도록 prefix를 분리합니다.
+  private readonly INDEX_PREFIX = 'campaignIndex:';
+  private readonly CAMPAIGN_IDS_INDEX_KEY = `${this.INDEX_PREFIX}ids`;
+  private readonly CAMPAIGN_ACTIVE_INDEX_KEY = `${this.INDEX_PREFIX}active`;
+
+  private readonly CAMPAIGN_CACHE_TTL = 60 * 60 * 24; // 밀리초 아닌 초 단위, 24시간
   private readonly ALL_CAMPAIGNS_CACHE_TTL_MS = 60_000; // RTB decision hot path (짧은 TTL로 Redis SCAN/JSON.GET 비용 완화)
   private allCampaignsCache: {
     value: CachedCampaign[];
@@ -36,7 +41,9 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
 
     try {
       await this.ioredisClient.call('JSON.SET', key, '$', JSON.stringify(data));
-      await this.ioredisClient.expire(key, ttl);
+      await this.ioredisClient.expire(key, ttl); // ioredis의 expire메서드는 ttl을 초 단위로 받는다.
+      // 인덱스 갱신 실패가 캠페인 캐시 저장 자체를 실패시키면 운영 리스크가 커져서 best-effort로 처리합니다.
+      await this.bestEffortUpdateCampaignIndices(id, data.status);
     } catch (error) {
       this.logger.error(`캐시 저장 실패: ${id}`, error);
       throw error;
@@ -79,6 +86,8 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       );
 
       await Promise.all(updatePromises);
+      // updateCampaignWithoutCachedById에는 status가 포함될 수 있으므로 active 인덱스 정합성을 유지합니다.
+      await this.bestEffortUpdateCampaignIndices(id, data.status);
     } catch (error) {
       this.logger.error(`캐시 저장 실패: ${id}`, error);
       throw error;
@@ -96,6 +105,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
         '$.status',
         JSON.stringify(status)
       );
+      await this.bestEffortUpdateCampaignIndices(id, status);
     } catch (error) {
       this.logger.error(`캠페인 상태 업데이트 실패: ${id}`, error);
       throw error;
@@ -229,6 +239,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
 
   async deleteCampaignCacheById(id: string): Promise<void> {
     const key = this.getCampaignCacheKey(id);
+    await this.bestEffortRemoveCampaignIndices(id);
     await this.ioredisClient.del(key);
     this.logger.debug(`캐시 삭제: ${id}`);
   }
@@ -352,5 +363,37 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
 
   private getCampaignCacheKey(id: string): string {
     return `${this.KEY_PREFIX}${id}`;
+  }
+
+  private async bestEffortUpdateCampaignIndices(
+    id: string,
+    status: string
+  ): Promise<void> {
+    try {
+      // 전체 캠페인 id를 추적하여 추후 백필(backfill)/마이그레이션에 활용합니다.
+      await this.ioredisClient.sadd(this.CAMPAIGN_IDS_INDEX_KEY, id); // sadd는 Set Add 호출 메서드
+
+      if (status === 'ACTIVE') {
+        await this.ioredisClient.sadd(this.CAMPAIGN_ACTIVE_INDEX_KEY, id);
+      } else {
+        await this.ioredisClient.srem(this.CAMPAIGN_ACTIVE_INDEX_KEY, id);
+      }
+    } catch (error) {
+      this.logger.warn(
+        `캠페인 인덱스 업데이트 실패: ${id} (status=${status})`,
+        error
+      );
+    }
+  }
+
+  private async bestEffortRemoveCampaignIndices(id: string): Promise<void> {
+    try {
+      await Promise.all([
+        this.ioredisClient.srem(this.CAMPAIGN_IDS_INDEX_KEY, id),
+        this.ioredisClient.srem(this.CAMPAIGN_ACTIVE_INDEX_KEY, id),
+      ]);
+    } catch (error) {
+      this.logger.warn(`캠페인 인덱스 삭제 실패: ${id}`, error);
+    }
   }
 }
