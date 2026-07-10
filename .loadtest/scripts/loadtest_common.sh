@@ -82,11 +82,15 @@ for _, key in ipairs(keys) do
     n = n + 1
   end
 end
+redis.call("DEL", KEYS[2], KEYS[3])
 return n
 '
 
   modified="$(
-    docker exec "$redis_container" redis-cli EVAL "$lua" 1 campaign:keys
+    docker exec "$redis_container" redis-cli EVAL "$lua" 3 \
+      campaign:keys \
+      rtb:budget:daily-exhausted-campaigns \
+      rtb:budget:total-exhausted-campaigns
   )"
   modified="$(printf '%s' "$modified" | tr -d '[:space:]')"
   if [ -z "$modified" ] || [ "$modified" = "(nil)" ]; then

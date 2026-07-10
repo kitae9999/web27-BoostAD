@@ -33,11 +33,73 @@ describe('RedisCampaignCacheRepository winner-only reservation', () => {
     expect(result).toEqual({ campaignId: 'second', attemptedCount: 2 });
     expect(redis.eval).toHaveBeenCalledWith(
       expect.any(String),
-      2,
+      4,
+      'rtb:budget:daily-exhausted-campaigns',
+      'rtb:budget:total-exhausted-campaigns',
       'campaign:first',
       'campaign:second',
       '10',
-      '20'
+      '20',
+      'first',
+      'second'
+    );
+  });
+
+  it('merges daily and total exhausted campaign IDs from Redis', async () => {
+    const pipeline = {
+      smembers: jest.fn().mockReturnThis(),
+      exec: jest.fn().mockResolvedValue([
+        [null, ['daily-only', 'both']],
+        [null, ['total-only', 'both']],
+      ]),
+    };
+    const redis = {
+      pipeline: jest.fn(() => pipeline),
+    } as unknown as AppIORedisClient;
+    const config = {
+      get: jest.fn((_key: string, defaultValue: number) => defaultValue),
+    } as unknown as ConfigService;
+    const repository = new RedisCampaignCacheRepository(
+      redis,
+      config,
+      new EventEmitter2()
+    );
+
+    await expect(repository.getBudgetExhaustedCampaignIds()).resolves.toEqual(
+      expect.arrayContaining(['daily-only', 'total-only', 'both'])
+    );
+    expect(pipeline.smembers).toHaveBeenNthCalledWith(
+      1,
+      'rtb:budget:daily-exhausted-campaigns'
+    );
+    expect(pipeline.smembers).toHaveBeenNthCalledWith(
+      2,
+      'rtb:budget:total-exhausted-campaigns'
+    );
+  });
+
+  it('clears both eligibility scopes when budget inputs change', async () => {
+    const redis = {
+      srem: jest.fn().mockResolvedValue(1),
+    } as unknown as AppIORedisClient & { srem: jest.Mock };
+    const config = {
+      get: jest.fn((_key: string, defaultValue: number) => defaultValue),
+    } as unknown as ConfigService;
+    const repository = new RedisCampaignCacheRepository(
+      redis,
+      config,
+      new EventEmitter2()
+    );
+
+    await repository.clearBudgetExhaustion('campaign-1');
+
+    expect(redis.srem).toHaveBeenCalledWith(
+      'rtb:budget:daily-exhausted-campaigns',
+      'campaign-1'
+    );
+    expect(redis.srem).toHaveBeenCalledWith(
+      'rtb:budget:total-exhausted-campaigns',
+      'campaign-1'
     );
   });
 

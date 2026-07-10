@@ -49,10 +49,8 @@ export class CampaignCronService {
       // 1. 종료일 지난 캠페인 ENDED (Redis First) - 비딩 차단 최우선
       const stoppedCount = await this.stopExpiredCampaigns(cachedCampaigns);
 
-      // 2. 예산 소진 캠페인 PAUSED (Redis → DB)
-      const pausedCount = await this.pauseOverspentCampaigns(cachedCampaigns);
-
-      // 3. ClickLog 기반 Spent 정산 (ClickLog → DB → Redis) - 배치 처리
+      // 예산 소진은 campaign status가 아니라 별도 eligibility set으로 관리한다.
+      // 2. ClickLog 기반 Spent 정산 (ClickLog → DB → Redis) - 배치 처리
       // 자정 정산이므로 '어제' 데이터 기준
       const yesterday = new Date();
       yesterday.setDate(yesterday.getDate() - 1);
@@ -70,7 +68,6 @@ export class CampaignCronService {
       this.logger.log(
         `===== 일일 정산 완료 ===== ` +
           `종료: ${stoppedCount}건, ` +
-          `예산PAUSED: ${pausedCount}건, ` +
           `정산보정: ${reconciledCount}건, ` +
           `시작: ${startedCount}건,` +
           `고아이미지: ${orphanImagesDeleted}건`
@@ -213,7 +210,6 @@ export class CampaignCronService {
     });
 
     const stopped = await this.stopExpiredCampaigns(cachedCampaigns);
-    const paused = await this.pauseOverspentCampaigns(cachedCampaigns);
     const started = await this.startScheduledCampaigns();
     await this.resetDailyBudgets(cachedCampaigns);
     const orphanImagesDeleted = await this.cleanupOrphanImages();
@@ -221,7 +217,8 @@ export class CampaignCronService {
     this.logger.log('수동 Lazy Reset 완료');
 
     return {
-      statusUpdate: { started, stopped, paused },
+      // 응답 계약은 유지하되 budget exhaustion으로 PAUSED를 만들지 않는다.
+      statusUpdate: { started, stopped, paused: 0 },
       dailyBudgetReset: true,
       orphanImagesDeleted,
     };
@@ -259,34 +256,6 @@ export class CampaignCronService {
     }
     this.logger.log(`[Step 1] 만료 캠페인 종료 완료: ${stoppedCount}개`);
     return stoppedCount;
-  }
-
-  // 예산 소진 캠페인 PAUSED (Redis First)
-  private async pauseOverspentCampaigns(
-    cachedCampaigns: CachedCampaign[]
-  ): Promise<number> {
-    this.logger.log(`[Step 2] 예산 소진 캠페인 PAUSED 처리 시작`);
-    let pausedCount = 0;
-
-    for (const cached of cachedCampaigns) {
-      if (cached.deletedAt || cached.status !== 'ACTIVE') continue;
-
-      const isDailyExhausted = cached.dailySpent >= cached.dailyBudget;
-      const isTotalExhausted =
-        cached.totalBudget !== null && cached.totalSpent >= cached.totalBudget;
-
-      if (isDailyExhausted || isTotalExhausted) {
-        await this.syncCacheStatus(cached.id, CampaignStatus.PAUSED);
-        await this.campaignRepository.updateStatus(
-          cached.id,
-          CampaignStatus.PAUSED
-        );
-        pausedCount++;
-        this.logger.log(`캠페인 ${cached.id} 예산 소진 -> PAUSED`);
-      }
-    }
-    this.logger.log(`[Step 2] 예산 소진 PAUSED 완료: ${pausedCount}개`);
-    return pausedCount;
   }
 
   // 시작일 된 캠페인 ACTIVE (DB First - PENDING은 Redis에 없을 수 있음)

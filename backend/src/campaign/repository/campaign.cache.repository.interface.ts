@@ -43,6 +43,13 @@ export abstract class CampaignCacheRepository {
     candidates: BudgetReservationCandidate[]
   ): Promise<BudgetReservationResult | null>;
 
+  abstract getBudgetExhaustedCampaignIds(): Promise<string[]>;
+
+  abstract clearBudgetExhaustion(
+    campaignId: string,
+    scopes?: { daily?: boolean; total?: boolean }
+  ): Promise<void>;
+
   // Spent 롤백 (비딩 패배 시)
   // dailySpent -= cpc, totalSpent -= cpc
   abstract decrementSpent(campaignId: string, cpc: number): Promise<void>;

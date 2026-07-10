@@ -48,6 +48,8 @@ export class LoadtestService {
     'backup:rollback:view:*',
     'dedup:view:*',
     'dedup:click:*',
+    'rtb:budget:daily-exhausted-campaigns',
+    'rtb:budget:total-exhausted-campaigns',
   ];
 
   constructor(
@@ -94,9 +96,8 @@ export class LoadtestService {
       options.clearLogs
     );
 
-    counts.redisCampaignsReset = await this.resetRedisCampaignState(
-      scopedCampaignIds
-    );
+    counts.redisCampaignsReset =
+      await this.resetRedisCampaignState(scopedCampaignIds);
     counts.drainedBidlogJobs = drainedBidlogJobs;
 
     if (options.clearAuxRedisKeys) {
@@ -122,7 +123,9 @@ export class LoadtestService {
       );
     }
 
-    const expectedToken = this.configService.get<string>('LOADTEST_RESET_TOKEN');
+    const expectedToken = this.configService.get<string>(
+      'LOADTEST_RESET_TOKEN'
+    );
     if (!expectedToken) {
       throw new ServiceUnavailableException(
         'LOADTEST_RESET_TOKEN이 설정되지 않아 reset endpoint를 사용할 수 없습니다.'
@@ -130,7 +133,9 @@ export class LoadtestService {
     }
 
     if (!providedToken || providedToken !== expectedToken) {
-      throw new UnauthorizedException('유효한 loadtest reset token이 필요합니다.');
+      throw new UnauthorizedException(
+        '유효한 loadtest reset token이 필요합니다.'
+      );
     }
   }
 
@@ -243,7 +248,9 @@ export class LoadtestService {
     });
   }
 
-  private async resetRedisCampaignState(campaignIds: string[]): Promise<number> {
+  private async resetRedisCampaignState(
+    campaignIds: string[]
+  ): Promise<number> {
     let resetCount = 0;
     const resetTimestamp = new Date().toISOString();
 

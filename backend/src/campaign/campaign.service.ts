@@ -64,8 +64,7 @@ export class CampaignService {
       configService.get<string>(
         'RTB_DENSE_RETRIEVAL_MODE',
         'semantic_document'
-      ) ===
-      'semantic_document';
+      ) === 'semantic_document';
   }
 
   @OnEvent('ml.model.ready')
@@ -571,6 +570,15 @@ export class CampaignService {
         updatedCampaign.id,
         this.convertToCachedCampaignTypeWithoutSpent(updatedCampaign)
       );
+      if (
+        dto.maxCpc !== undefined ||
+        dto.dailyBudget !== undefined ||
+        dto.totalBudget !== undefined
+      ) {
+        // maxCpc 또는 budget이 바뀌면 기존 "다음 예약 불가" 판단은 더 이상
+        // 유효하지 않다. 다음 reserve가 최신 값으로 다시 판단하도록 해제한다.
+        await this.campaignCacheRepository.clearBudgetExhaustion(campaignId);
+      }
       this.logger.log(
         `캠페인 ${campaignId} Redis 최종 동기화 완료 (상태: ${updatedCampaign.status})`
       );

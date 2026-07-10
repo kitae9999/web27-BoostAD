@@ -18,7 +18,12 @@ import {
   REDIS_DECREMENT_SPENT_SCRIPT,
   REDIS_INCREMENT_SPENT_SCRIPT,
   REDIS_RESERVE_FIRST_AVAILABLE_SCRIPT,
+  REDIS_RESET_DAILY_SPENT_SCRIPT,
 } from '../scripts/lua-script';
+import {
+  DAILY_BUDGET_EXHAUSTED_SET,
+  TOTAL_BUDGET_EXHAUSTED_SET,
+} from '../constants/budget-eligibility.constants';
 import {
   createRtbPathLogger,
   rtbPathLogsEnabled,
@@ -291,16 +296,14 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
     const key = this.getCampaignCacheKey(id);
 
     try {
-      // 개별 필드만 원자적으로 업데이트
-      await Promise.all([
-        this.ioredisClient.call('JSON.SET', key, '$.dailySpent', '0'),
-        this.ioredisClient.call(
-          'JSON.SET',
-          key,
-          '$.lastResetDate',
-          JSON.stringify(new Date().toISOString())
-        ),
-      ]);
+      await this.ioredisClient.eval(
+        REDIS_RESET_DAILY_SPENT_SCRIPT,
+        2,
+        key,
+        DAILY_BUDGET_EXHAUSTED_SET,
+        id,
+        JSON.stringify(new Date().toISOString())
+      );
     } catch (error) {
       this.logger.error(`일일 예산 리셋 실패: ${id}`, error);
       throw error;
@@ -319,11 +322,14 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       // lua 스크립트로 트랜잭션 처리
       const result = (await this.ioredisClient.eval(
         REDIS_INCREMENT_SPENT_SCRIPT,
-        1,
+        3,
         key,
+        DAILY_BUDGET_EXHAUSTED_SET,
+        TOTAL_BUDGET_EXHAUSTED_SET,
         cpc.toString(),
         dailyBudget.toString(),
-        totalBudget !== null ? totalBudget.toString() : 'null'
+        totalBudget !== null ? totalBudget.toString() : 'null',
+        campaignId
       )) as number;
 
       if (result === 1) {
@@ -365,17 +371,24 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       return null;
     }
 
-    const keys = candidates.map((candidate) =>
+    const campaignKeys = candidates.map((candidate) =>
       this.getCampaignCacheKey(candidate.campaignId)
     );
     const cpcs = candidates.map((candidate) => String(candidate.cpc));
+    const campaignIds = candidates.map((candidate) => candidate.campaignId);
+    const keys = [
+      DAILY_BUDGET_EXHAUSTED_SET,
+      TOTAL_BUDGET_EXHAUSTED_SET,
+      ...campaignKeys,
+    ];
 
     try {
       const result = (await this.ioredisClient.eval(
         REDIS_RESERVE_FIRST_AVAILABLE_SCRIPT,
         keys.length,
         ...keys,
-        ...cpcs
+        ...cpcs,
+        ...campaignIds
       )) as [number, number];
       const selectedIndex = Number(result?.[0] ?? 0);
       const attemptedCount = Number(result?.[1] ?? candidates.length);
@@ -394,15 +407,60 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
     }
   }
 
+  async getBudgetExhaustedCampaignIds(): Promise<string[]> {
+    const pipeline = this.ioredisClient.pipeline();
+    pipeline.smembers(DAILY_BUDGET_EXHAUSTED_SET);
+    pipeline.smembers(TOTAL_BUDGET_EXHAUSTED_SET);
+    const results = await pipeline.exec();
+    if (!results) {
+      throw new Error('budget exhausted set 조회 결과가 없습니다.');
+    }
+
+    const exhausted = new Set<string>();
+    for (const [error, value] of results) {
+      if (error) {
+        throw error;
+      }
+      if (Array.isArray(value)) {
+        value.forEach((id) => exhausted.add(String(id)));
+      }
+    }
+    return [...exhausted];
+  }
+
+  async clearBudgetExhaustion(
+    campaignId: string,
+    scopes: { daily?: boolean; total?: boolean } = {
+      daily: true,
+      total: true,
+    }
+  ): Promise<void> {
+    const commands: Promise<unknown>[] = [];
+    if (scopes.daily !== false) {
+      commands.push(
+        this.ioredisClient.srem(DAILY_BUDGET_EXHAUSTED_SET, campaignId)
+      );
+    }
+    if (scopes.total !== false) {
+      commands.push(
+        this.ioredisClient.srem(TOTAL_BUDGET_EXHAUSTED_SET, campaignId)
+      );
+    }
+    await Promise.all(commands);
+  }
+
   async decrementSpent(campaignId: string, cpc: number): Promise<void> {
     const key = this.getCampaignCacheKey(campaignId);
 
     try {
       const result = (await this.ioredisClient.eval(
         REDIS_DECREMENT_SPENT_SCRIPT,
-        1,
+        3,
         key,
-        cpc.toString() // 양수로 전달 (Lua에서 -cpc 처리)
+        DAILY_BUDGET_EXHAUSTED_SET,
+        TOTAL_BUDGET_EXHAUSTED_SET,
+        cpc.toString(), // 양수로 전달 (Lua에서 -cpc 처리)
+        campaignId
       )) as number;
 
       if (result === 1) {
@@ -440,6 +498,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
     await Promise.all([
       this.ioredisClient.del(key),
       this.ioredisClient.srem(this.CAMPAIGN_KEYS_SET, key),
+      this.clearBudgetExhaustion(id),
       this.deleteCampaignTagVectorDocs(id),
       this.deleteCampaignDocumentVectorDoc(id),
     ]);
