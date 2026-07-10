@@ -119,6 +119,24 @@ export class MetricsService {
     registers: [this.registry],
   });
 
+  private readonly rtbBudgetHintExcludedTotal = new Counter({
+    name: 'boostad_rtb_budget_hint_excluded_total',
+    help: 'Budget eligibility hint로 matcher 후보에서 제외된 캠페인 수',
+    registers: [this.registry],
+  });
+
+  private readonly rtbBudgetHintSnapshotSize = new Gauge({
+    name: 'boostad_rtb_budget_hint_snapshot_size',
+    help: '현재 RTB 인스턴스가 보유한 budget exhausted campaign 수',
+    registers: [this.registry],
+  });
+
+  private readonly rtbBudgetHintRefreshErrorTotal = new Counter({
+    name: 'boostad_rtb_budget_hint_refresh_error_total',
+    help: 'Budget eligibility hint snapshot 갱신 실패 수',
+    registers: [this.registry],
+  });
+
   private readonly rtbAnnTagHitCount = new Histogram({
     name: 'boostad_rtb_ann_tag_hit_count',
     help: 'ANN retrieval이 반환한 tag hit 수 분포',
@@ -426,6 +444,20 @@ export class MetricsService {
 
   observeRtbEligibleCampaignCount(count: number) {
     this.rtbEligibleCampaignCount.observe(count);
+  }
+
+  incRtbBudgetHintExcluded(count = 1) {
+    if (count > 0) this.rtbBudgetHintExcludedTotal.inc(count);
+  }
+
+  setRtbBudgetHintSnapshotSize(count: number) {
+    if (Number.isFinite(count) && count >= 0) {
+      this.rtbBudgetHintSnapshotSize.set(count);
+    }
+  }
+
+  incRtbBudgetHintRefreshError() {
+    this.rtbBudgetHintRefreshErrorTotal.inc();
   }
 
   observeRtbAnnTagHitCount(count: number) {

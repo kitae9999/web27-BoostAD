@@ -21,6 +21,7 @@ import {
   fuseHybridRankings,
   type RetrievalHit,
 } from '../retrieval/hybrid-retrieval.fusion';
+import { BudgetEligibilityHintService } from '../budget/budget-eligibility-hint.service';
 
 type MatchableCampaign = CachedCampaign | ServingCampaign;
 type DenseRetrievalMode = 'legacy_tag' | 'semantic_document';
@@ -79,6 +80,7 @@ export class TransformerMatcher extends Matcher {
     private readonly mlEngine: MLEngine,
     private readonly requestEmbeddingCache: RequestEmbeddingCacheService,
     private readonly contextEmbeddingService: ContextEmbeddingService,
+    private readonly budgetEligibilityHint: BudgetEligibilityHintService,
     private readonly metricsService: MetricsService,
     private readonly configService: ConfigService
   ) {
@@ -799,9 +801,7 @@ export class TransformerMatcher extends Matcher {
     }
 
     const taggedCampaigns =
-      await this.campaignServingSnapshot.findCampaignsByTags([
-        ...requestTags,
-      ]);
+      await this.campaignServingSnapshot.findCampaignsByTags([...requestTags]);
     const eligibleCampaigns = this.filterEligibleCampaigns(
       taggedCampaigns,
       context.isHighIntent,
@@ -979,7 +979,7 @@ export class TransformerMatcher extends Matcher {
   ): MatchableCampaign[] {
     const now = new Date();
 
-    return campaigns.filter((campaign) => {
+    const servingEligible = campaigns.filter((campaign) => {
       // 삭제된 캠페인 제외
       if (campaign.deletedAt) {
         return false;
@@ -1014,6 +1014,8 @@ export class TransformerMatcher extends Matcher {
 
       return true;
     });
+
+    return this.budgetEligibilityHint.filterEligible(servingEligible);
   }
 
   private normalizeText(text: string): string {

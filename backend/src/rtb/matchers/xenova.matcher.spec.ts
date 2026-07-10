@@ -7,6 +7,7 @@ import { CampaignCacheRepository } from '../../campaign/repository/campaign.cach
 import type { CachedCampaign } from '../../campaign/types/campaign.types';
 import { CampaignServingSnapshotService } from '../../campaign/campaign-serving-snapshot.service';
 import { ContextEmbeddingService } from '../context/context-embedding.service';
+import { BudgetEligibilityHintService } from '../budget/budget-eligibility-hint.service';
 
 describe('TransformerMatcher ANN path', () => {
   const now = new Date('2026-03-29T00:00:00.000Z');
@@ -43,6 +44,9 @@ describe('TransformerMatcher ANN path', () => {
       incRtbFallback: jest.fn(),
       recordRtbStage: jest.fn(),
       observeRtbEligibleCampaignCount: jest.fn(),
+      incRtbBudgetHintExcluded: jest.fn(),
+      setRtbBudgetHintSnapshotSize: jest.fn(),
+      incRtbBudgetHintRefreshError: jest.fn(),
       observeRtbAnnTagHitCount: jest.fn(),
       observeRtbAnnRetrievedCampaignCount: jest.fn(),
       incRtbEmbeddingL1Hit: jest.fn(),
@@ -121,7 +125,10 @@ describe('TransformerMatcher ANN path', () => {
     config: ConfigService,
     contextEmbeddingService = {
       resolveForDecision: jest.fn().mockResolvedValue({ status: 'MISS' }),
-    } as unknown as ContextEmbeddingService
+    } as unknown as ContextEmbeddingService,
+    budgetEligibilityHint = {
+      filterEligible: jest.fn((campaigns) => campaigns),
+    } as unknown as BudgetEligibilityHintService
   ) =>
     new TransformerMatcher(
       repository,
@@ -129,6 +136,7 @@ describe('TransformerMatcher ANN path', () => {
       mlEngine,
       buildEmbeddingCache(mlEngine, metrics, config),
       contextEmbeddingService,
+      budgetEligibilityHint,
       metrics,
       config
     );
@@ -146,6 +154,8 @@ describe('TransformerMatcher ANN path', () => {
       updateCampaignStatus: jest.fn(),
       updateDailySpentCacheById: jest.fn(),
       incrementSpent: jest.fn(),
+      getBudgetExhaustedCampaignIds: jest.fn().mockResolvedValue([]),
+      clearBudgetExhaustion: jest.fn(),
       decrementSpent: jest.fn(),
       deleteCampaignEmbeddingById: jest.fn(),
       updateCampaignEmbeddingTags: jest.fn(),

@@ -36,6 +36,7 @@ import { BidLogModule } from '../bid-log/bid-log.module';
 
 import { BlogModule } from '../blog/blog.module';
 import { MetricsModule } from '../metrics/metrics.module';
+import { BudgetEligibilityHintService } from './budget/budget-eligibility-hint.service';
 
 import { QueueModule } from '../queue/queue.module';
 
@@ -54,6 +55,7 @@ import { QueueModule } from '../queue/queue.module';
     RTBService,
     RequestEmbeddingCacheService,
     ContextEmbeddingService,
+    BudgetEligibilityHintService,
 
     // Matcher
     {
