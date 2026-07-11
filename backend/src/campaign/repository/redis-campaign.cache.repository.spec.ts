@@ -103,6 +103,95 @@ describe('RedisCampaignCacheRepository winner-only reservation', () => {
     );
   });
 
+  it('maps an atomic auction reservation result and passes reservation keys', async () => {
+    const reservation = {
+      auctionId: 'auction-1',
+      requestFingerprint: 'fingerprint-1',
+      campaignId: 'campaign-2',
+      blogId: 7,
+      reservedAmount: 20,
+      budgetDate: '2026-07-11',
+      status: 'RESERVED',
+      createdAt: 1000,
+      updatedAt: 1000,
+      expiresAt: 2000,
+    };
+    const redis = {
+      eval: jest
+        .fn()
+        .mockResolvedValue([1, 'campaign-2', 2, JSON.stringify(reservation)]),
+    } as unknown as AppIORedisClient & { eval: jest.Mock };
+    const config = {
+      get: jest.fn((_key: string, defaultValue: number) => defaultValue),
+    } as unknown as ConfigService;
+    const repository = new RedisCampaignCacheRepository(
+      redis,
+      config,
+      new EventEmitter2()
+    );
+
+    await expect(
+      repository.reserveAuction({
+        auctionId: 'auction-1',
+        requestFingerprint: 'fingerprint-1',
+        blogId: 7,
+        budgetDate: '2026-07-11',
+        expiresAt: 2000,
+        resultTtlSeconds: 1800,
+        candidates: [
+          { campaignId: 'campaign-1', cpc: 10 },
+          { campaignId: 'campaign-2', cpc: 20 },
+        ],
+      })
+    ).resolves.toEqual({
+      outcome: 'reserved',
+      reservation,
+      attemptedCount: 2,
+    });
+
+    expect(redis.eval).toHaveBeenCalledWith(
+      expect.any(String),
+      8,
+      'rtb:reservation:auction-1',
+      'rtb:reservation:expirations',
+      'rtb:budget:daily-reserved:2026-07-11',
+      'rtb:budget:total-reserved',
+      'rtb:budget:daily-exhausted-campaigns',
+      'rtb:budget:total-exhausted-campaigns',
+      'campaign:campaign-1',
+      'campaign:campaign-2',
+      'fingerprint-1',
+      'auction-1',
+      '7',
+      '2026-07-11',
+      '2000',
+      '1800',
+      '10',
+      '20',
+      'campaign-1',
+      'campaign-2'
+    );
+  });
+
+  it('treats a repeated auction with another fingerprint as conflict', async () => {
+    const { repository } = buildRepository([-2, 'campaign-1', 0] as unknown as [
+      number,
+      number,
+    ]);
+
+    await expect(
+      repository.reserveAuction({
+        auctionId: 'auction-1',
+        requestFingerprint: 'different',
+        blogId: 7,
+        budgetDate: '2026-07-11',
+        expiresAt: 2000,
+        resultTtlSeconds: 1800,
+        candidates: [{ campaignId: 'campaign-1', cpc: 10 }],
+      })
+    ).resolves.toMatchObject({ outcome: 'conflict', attemptedCount: 0 });
+  });
+
   it('returns null when no campaign in the window is reservable', async () => {
     const { repository } = buildRepository([0, 2]);
 

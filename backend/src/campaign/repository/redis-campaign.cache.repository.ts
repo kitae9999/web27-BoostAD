@@ -7,21 +7,32 @@ import { CampaignCacheRepository } from './campaign.cache.repository.interface';
 import {
   BudgetReservationCandidate,
   BudgetReservationResult,
+  AuctionReservation,
+  AuctionTransitionResult,
   CachedCampaign,
   CachedCampaignWithoutSpent,
   CampaignDocumentVectorSearchHit,
   CampaignEmbeddingPayload,
   CampaignTagVectorSearchHit,
   CampaignTagVectorSearchOptions,
+  ReserveAuctionRequest,
+  ReserveAuctionResult,
 } from '../types/campaign.types';
 import {
   REDIS_DECREMENT_SPENT_SCRIPT,
   REDIS_INCREMENT_SPENT_SCRIPT,
   REDIS_RESERVE_FIRST_AVAILABLE_SCRIPT,
   REDIS_RESET_DAILY_SPENT_SCRIPT,
+  REDIS_RESERVE_AUCTION_SCRIPT,
+  REDIS_COMMIT_AUCTION_SCRIPT,
+  REDIS_RELEASE_AUCTION_SCRIPT,
 } from '../scripts/lua-script';
 import {
+  AUCTION_RESERVATION_EXPIRATIONS,
+  AUCTION_RESERVATION_KEY_PREFIX,
+  DAILY_BUDGET_RESERVED_HASH_PREFIX,
   DAILY_BUDGET_EXHAUSTED_SET,
+  TOTAL_BUDGET_RESERVED_HASH,
   TOTAL_BUDGET_EXHAUSTED_SET,
 } from '../constants/budget-eligibility.constants';
 import {
@@ -428,6 +439,134 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
     return [...exhausted];
   }
 
+  async reserveAuction(
+    request: ReserveAuctionRequest
+  ): Promise<ReserveAuctionResult> {
+    if (request.candidates.length === 0) {
+      return { outcome: 'exhausted', attemptedCount: 0 };
+    }
+
+    const campaignKeys = request.candidates.map((candidate) =>
+      this.getCampaignCacheKey(candidate.campaignId)
+    );
+    const keys = [
+      this.getAuctionReservationKey(request.auctionId),
+      AUCTION_RESERVATION_EXPIRATIONS,
+      this.getDailyReservedHashKey(request.budgetDate),
+      TOTAL_BUDGET_RESERVED_HASH,
+      DAILY_BUDGET_EXHAUSTED_SET,
+      TOTAL_BUDGET_EXHAUSTED_SET,
+      ...campaignKeys,
+    ];
+    const cpcs = request.candidates.map((candidate) => String(candidate.cpc));
+    const campaignIds = request.candidates.map(
+      (candidate) => candidate.campaignId
+    );
+
+    const result = (await this.ioredisClient.eval(
+      REDIS_RESERVE_AUCTION_SCRIPT,
+      keys.length,
+      ...keys,
+      request.requestFingerprint,
+      request.auctionId,
+      String(request.blogId),
+      request.budgetDate,
+      String(request.expiresAt),
+      String(request.resultTtlSeconds),
+      ...cpcs,
+      ...campaignIds
+    )) as [number, string, number, string];
+    const code = Number(result?.[0] ?? 0);
+    const attemptedCount = Number(result?.[2] ?? request.candidates.length);
+    const reservation = this.parseAuctionReservation(result?.[3]);
+
+    if (code === -2) {
+      return {
+        outcome: 'conflict',
+        ...(reservation ? { reservation } : {}),
+        attemptedCount,
+      };
+    }
+    if (code === 2) {
+      return {
+        outcome: 'replayed',
+        ...(reservation ? { reservation } : {}),
+        attemptedCount,
+      };
+    }
+    if (code === 1) {
+      return {
+        outcome: 'reserved',
+        ...(reservation ? { reservation } : {}),
+        attemptedCount,
+      };
+    }
+    return { outcome: 'exhausted', attemptedCount };
+  }
+
+  async getAuctionReservation(
+    auctionId: string
+  ): Promise<AuctionReservation | null> {
+    const raw = await this.ioredisClient.get(
+      this.getAuctionReservationKey(auctionId)
+    );
+    return this.parseAuctionReservation(raw);
+  }
+
+  async commitAuction(
+    auctionId: string,
+    currentBudgetDate: string,
+    terminalTtlSeconds: number
+  ): Promise<AuctionTransitionResult> {
+    const reservation = await this.getAuctionReservation(auctionId);
+    if (!reservation) return { outcome: 'not_found' };
+
+    const keys = this.getAuctionTransitionKeys(reservation);
+    const result = (await this.ioredisClient.eval(
+      REDIS_COMMIT_AUCTION_SCRIPT,
+      keys.length,
+      ...keys,
+      auctionId,
+      currentBudgetDate,
+      String(terminalTtlSeconds),
+      String(Date.now())
+    )) as [number, string];
+    return this.mapAuctionTransition(result, 'commit');
+  }
+
+  async releaseAuction(
+    auctionId: string,
+    terminalTtlSeconds: number
+  ): Promise<AuctionTransitionResult> {
+    const reservation = await this.getAuctionReservation(auctionId);
+    if (!reservation) return { outcome: 'not_found' };
+
+    const keys = this.getAuctionTransitionKeys(reservation);
+    const result = (await this.ioredisClient.eval(
+      REDIS_RELEASE_AUCTION_SCRIPT,
+      keys.length,
+      ...keys,
+      auctionId,
+      String(terminalTtlSeconds),
+      String(Date.now())
+    )) as [number, string];
+    return this.mapAuctionTransition(result, 'release');
+  }
+
+  async findExpiredAuctionIds(
+    nowEpochMs: number,
+    limit: number
+  ): Promise<string[]> {
+    return this.ioredisClient.zrangebyscore(
+      AUCTION_RESERVATION_EXPIRATIONS,
+      0,
+      nowEpochMs,
+      'LIMIT',
+      0,
+      limit
+    );
+  }
+
   async clearBudgetExhaustion(
     campaignId: string,
     scopes: { daily?: boolean; total?: boolean } = {
@@ -724,6 +863,82 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
 
   private getCampaignCacheKey(id: string): string {
     return `${this.KEY_PREFIX}${id}`;
+  }
+
+  private getAuctionReservationKey(auctionId: string): string {
+    return `${AUCTION_RESERVATION_KEY_PREFIX}${auctionId}`;
+  }
+
+  private getDailyReservedHashKey(budgetDate: string): string {
+    return `${DAILY_BUDGET_RESERVED_HASH_PREFIX}${budgetDate}`;
+  }
+
+  private getAuctionTransitionKeys(reservation: AuctionReservation): string[] {
+    return [
+      this.getAuctionReservationKey(reservation.auctionId),
+      AUCTION_RESERVATION_EXPIRATIONS,
+      this.getDailyReservedHashKey(reservation.budgetDate),
+      TOTAL_BUDGET_RESERVED_HASH,
+      DAILY_BUDGET_EXHAUSTED_SET,
+      TOTAL_BUDGET_EXHAUSTED_SET,
+      this.getCampaignCacheKey(reservation.campaignId),
+    ];
+  }
+
+  private parseAuctionReservation(
+    raw: string | null | undefined
+  ): AuctionReservation | null {
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as AuctionReservation;
+    } catch (error) {
+      this.logger.warn('auction reservation JSON 파싱 실패', error);
+      return null;
+    }
+  }
+
+  private mapAuctionTransition(
+    result: [number, string],
+    operation: 'commit' | 'release'
+  ): AuctionTransitionResult {
+    const code = Number(result?.[0] ?? -99);
+    const reservation = this.parseAuctionReservation(result?.[1]);
+    if (code === -99) return { outcome: 'not_found' };
+    if (operation === 'commit') {
+      if (code === 1)
+        return {
+          outcome: 'committed',
+          ...(reservation ? { reservation } : {}),
+        };
+      if (code === 2)
+        return {
+          outcome: 'already_committed',
+          ...(reservation ? { reservation } : {}),
+        };
+      if (code === -2)
+        return {
+          outcome: 'expired',
+          ...(reservation ? { reservation } : {}),
+        };
+      return {
+        outcome: 'already_released',
+        ...(reservation ? { reservation } : {}),
+      };
+    }
+    if (code === 1)
+      return {
+        outcome: 'released',
+        ...(reservation ? { reservation } : {}),
+      };
+    if (code === 2)
+      return {
+        outcome: 'already_released',
+        ...(reservation ? { reservation } : {}),
+      };
+    return {
+      outcome: 'already_committed',
+      ...(reservation ? { reservation } : {}),
+    };
   }
 
   private getCampaignTagVectorDocKey(

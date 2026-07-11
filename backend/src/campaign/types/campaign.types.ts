@@ -116,3 +116,45 @@ export type BudgetReservationResult = {
   campaignId: string;
   attemptedCount: number;
 };
+
+export type AuctionReservationStatus = 'RESERVED' | 'COMMITTED' | 'RELEASED';
+
+export type AuctionReservation = {
+  auctionId: string;
+  requestFingerprint: string;
+  campaignId: string;
+  blogId: number;
+  reservedAmount: number;
+  budgetDate: string;
+  status: AuctionReservationStatus;
+  createdAt: number;
+  updatedAt: number;
+  expiresAt: number;
+};
+
+export type ReserveAuctionRequest = {
+  auctionId: string;
+  requestFingerprint: string;
+  blogId: number;
+  budgetDate: string;
+  expiresAt: number;
+  resultTtlSeconds: number;
+  candidates: BudgetReservationCandidate[];
+};
+
+export type ReserveAuctionResult = {
+  outcome: 'reserved' | 'replayed' | 'conflict' | 'exhausted';
+  reservation?: AuctionReservation;
+  attemptedCount: number;
+};
+
+export type AuctionTransitionResult = {
+  outcome:
+    | 'committed'
+    | 'released'
+    | 'already_committed'
+    | 'already_released'
+    | 'expired'
+    | 'not_found';
+  reservation?: AuctionReservation;
+};

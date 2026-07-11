@@ -1,12 +1,16 @@
 import {
   BudgetReservationCandidate,
   BudgetReservationResult,
+  AuctionReservation,
+  AuctionTransitionResult,
   CachedCampaign,
   CachedCampaignWithoutSpent,
   CampaignDocumentVectorSearchHit,
   CampaignEmbeddingPayload,
   CampaignTagVectorSearchHit,
   CampaignTagVectorSearchOptions,
+  ReserveAuctionRequest,
+  ReserveAuctionResult,
 } from '../types/campaign.types';
 
 export abstract class CampaignCacheRepository {
@@ -49,6 +53,30 @@ export abstract class CampaignCacheRepository {
     campaignId: string,
     scopes?: { daily?: boolean; total?: boolean }
   ): Promise<void>;
+
+  abstract reserveAuction(
+    request: ReserveAuctionRequest
+  ): Promise<ReserveAuctionResult>;
+
+  abstract getAuctionReservation(
+    auctionId: string
+  ): Promise<AuctionReservation | null>;
+
+  abstract commitAuction(
+    auctionId: string,
+    currentBudgetDate: string,
+    terminalTtlSeconds: number
+  ): Promise<AuctionTransitionResult>;
+
+  abstract releaseAuction(
+    auctionId: string,
+    terminalTtlSeconds: number
+  ): Promise<AuctionTransitionResult>;
+
+  abstract findExpiredAuctionIds(
+    nowEpochMs: number,
+    limit: number
+  ): Promise<string[]>;
 
   // Spent 롤백 (비딩 패배 시)
   // dailySpent -= cpc, totalSpent -= cpc

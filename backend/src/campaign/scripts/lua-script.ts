@@ -217,3 +217,153 @@ export const REDIS_RESET_DAILY_SPENT_SCRIPT = `
   redis.call('SREM', KEYS[2], ARGV[1])
   return 1
 `;
+
+// Phase 1C: auction 멱등 예약.
+// KEYS[1] reservation key, [2] expiration zset, [3] daily reserved hash,
+// [4] total reserved hash, [5]/[6] exhausted sets, [7..] campaign JSON keys.
+// ARGV[1] fingerprint, [2] auctionId, [3] blogId, [4] budgetDate,
+// [5] expiresAt(ms), [6] result TTL(sec), [7..N] cpc, [7+N..] campaignId.
+// return: {code, campaignId, attemptedCount, reservationJson}
+// code 1=new, 2=replay, -2=fingerprint conflict, 0=exhausted
+export const REDIS_RESERVE_AUCTION_SCRIPT = `
+  local existingRaw = redis.call('GET', KEYS[1])
+  if existingRaw then
+    local existing = cjson.decode(existingRaw)
+    if existing.requestFingerprint ~= ARGV[1] then
+      return {-2, existing.campaignId or '', 0, existingRaw}
+    end
+    return {2, existing.campaignId or '', 0, existingRaw}
+  end
+
+  local candidateCount = #KEYS - 6
+  local redisTime = redis.call('TIME')
+  local nowMs = tonumber(redisTime[1]) * 1000 + math.floor(tonumber(redisTime[2]) / 1000)
+  for i = 1, candidateCount do
+    local campaignKey = KEYS[i + 6]
+    local cpc = tonumber(ARGV[6 + i])
+    local campaignId = ARGV[6 + candidateCount + i]
+    local statusRaw = redis.call('JSON.GET', campaignKey, '$.status')
+    local dailyBudgetRaw = redis.call('JSON.GET', campaignKey, '$.dailyBudget')
+    local totalBudgetRaw = redis.call('JSON.GET', campaignKey, '$.totalBudget')
+    local dailySpentRaw = redis.call('JSON.GET', campaignKey, '$.dailySpent')
+    local totalSpentRaw = redis.call('JSON.GET', campaignKey, '$.totalSpent')
+    local maxCpcRaw = redis.call('JSON.GET', campaignKey, '$.maxCpc')
+
+    if statusRaw and string.find(statusRaw, 'ACTIVE', 1, true)
+      and dailyBudgetRaw and totalBudgetRaw and dailySpentRaw and totalSpentRaw and maxCpcRaw then
+      local dailyBudget = tonumber(string.match(dailyBudgetRaw, '%[([%d%.]+)%]'))
+      local totalBudget = tonumber(string.match(totalBudgetRaw, '%[([%d%.]+)%]'))
+      local dailySpent = tonumber(string.match(dailySpentRaw, '%[([%d%.]+)%]')) or 0
+      local totalSpent = tonumber(string.match(totalSpentRaw, '%[([%d%.]+)%]')) or 0
+      local maxCpc = tonumber(string.match(maxCpcRaw, '%[([%d%.]+)%]')) or cpc
+      local dailyReserved = tonumber(redis.call('HGET', KEYS[3], campaignId)) or 0
+      local totalReserved = tonumber(redis.call('HGET', KEYS[4], campaignId)) or 0
+      local dailyEligible = dailyBudget and dailySpent + dailyReserved + cpc <= dailyBudget
+      local totalEligible = not totalBudget or totalSpent + totalReserved + cpc <= totalBudget
+
+      if dailyEligible and totalEligible then
+        local nextDailyReserved = redis.call('HINCRBYFLOAT', KEYS[3], campaignId, cpc)
+        local nextTotalReserved = redis.call('HINCRBYFLOAT', KEYS[4], campaignId, cpc)
+        local reservation = {
+          auctionId = ARGV[2],
+          requestFingerprint = ARGV[1],
+          campaignId = campaignId,
+          blogId = tonumber(ARGV[3]),
+          reservedAmount = cpc,
+          budgetDate = ARGV[4],
+          status = 'RESERVED',
+          createdAt = nowMs,
+          updatedAt = nowMs,
+          expiresAt = tonumber(ARGV[5])
+        }
+        local reservationJson = cjson.encode(reservation)
+        redis.call('SETEX', KEYS[1], tonumber(ARGV[6]), reservationJson)
+        redis.call('ZADD', KEYS[2], tonumber(ARGV[5]), ARGV[2])
+
+        if dailySpent + tonumber(nextDailyReserved) + maxCpc > dailyBudget then
+          redis.call('SADD', KEYS[5], campaignId)
+        else
+          redis.call('SREM', KEYS[5], campaignId)
+        end
+        if totalBudget and totalSpent + tonumber(nextTotalReserved) + maxCpc > totalBudget then
+          redis.call('SADD', KEYS[6], campaignId)
+        else
+          redis.call('SREM', KEYS[6], campaignId)
+        end
+        return {1, campaignId, i, reservationJson}
+      end
+
+      if dailySpent + dailyReserved + maxCpc > dailyBudget then
+        redis.call('SADD', KEYS[5], campaignId)
+      end
+      if totalBudget and totalSpent + totalReserved + maxCpc > totalBudget then
+        redis.call('SADD', KEYS[6], campaignId)
+      end
+    end
+  end
+  return {0, '', candidateCount, ''}
+`;
+
+// KEYS: reservation, expiration zset, daily reserved hash, total reserved hash,
+// daily/total exhausted set, campaign JSON.
+// ARGV: auctionId, currentBudgetDate, terminal TTL(sec), now(ms)
+export const REDIS_COMMIT_AUCTION_SCRIPT = `
+  local raw = redis.call('GET', KEYS[1])
+  if not raw then return {-99, ''} end
+  local reservation = cjson.decode(raw)
+  if reservation.status == 'COMMITTED' then return {2, raw} end
+  if reservation.status == 'RELEASED' then return {-1, raw} end
+
+  local amount = tonumber(reservation.reservedAmount)
+  local campaignId = reservation.campaignId
+  local function decrementHash(hashKey)
+    local nextValue = tonumber(redis.call('HINCRBYFLOAT', hashKey, campaignId, -amount)) or 0
+    if nextValue <= 0.000001 then redis.call('HDEL', hashKey, campaignId) end
+  end
+  decrementHash(KEYS[3])
+  decrementHash(KEYS[4])
+
+  if reservation.budgetDate ~= ARGV[2] then
+    reservation.status = 'RELEASED'
+    reservation.updatedAt = tonumber(ARGV[4])
+    local releasedRaw = cjson.encode(reservation)
+    redis.call('SETEX', KEYS[1], tonumber(ARGV[3]), releasedRaw)
+    redis.call('ZREM', KEYS[2], ARGV[1])
+    return {-2, releasedRaw}
+  end
+
+  redis.call('JSON.NUMINCRBY', KEYS[7], '$.dailySpent', amount)
+  redis.call('JSON.NUMINCRBY', KEYS[7], '$.totalSpent', amount)
+  reservation.status = 'COMMITTED'
+  reservation.updatedAt = tonumber(ARGV[4])
+  local committedRaw = cjson.encode(reservation)
+  redis.call('SETEX', KEYS[1], tonumber(ARGV[3]), committedRaw)
+  redis.call('ZREM', KEYS[2], ARGV[1])
+  return {1, committedRaw}
+`;
+
+// ARGV: auctionId, terminal TTL(sec), now(ms)
+export const REDIS_RELEASE_AUCTION_SCRIPT = `
+  local raw = redis.call('GET', KEYS[1])
+  if not raw then return {-99, ''} end
+  local reservation = cjson.decode(raw)
+  if reservation.status == 'COMMITTED' then return {-1, raw} end
+  if reservation.status == 'RELEASED' then return {2, raw} end
+
+  local amount = tonumber(reservation.reservedAmount)
+  local campaignId = reservation.campaignId
+  local function decrementHash(hashKey)
+    local nextValue = tonumber(redis.call('HINCRBYFLOAT', hashKey, campaignId, -amount)) or 0
+    if nextValue <= 0.000001 then redis.call('HDEL', hashKey, campaignId) end
+  end
+  decrementHash(KEYS[3])
+  decrementHash(KEYS[4])
+  reservation.status = 'RELEASED'
+  reservation.updatedAt = tonumber(ARGV[3])
+  local releasedRaw = cjson.encode(reservation)
+  redis.call('SETEX', KEYS[1], tonumber(ARGV[2]), releasedRaw)
+  redis.call('ZREM', KEYS[2], ARGV[1])
+  redis.call('SREM', KEYS[5], campaignId)
+  redis.call('SREM', KEYS[6], campaignId)
+  return {1, releasedRaw}
+`;
