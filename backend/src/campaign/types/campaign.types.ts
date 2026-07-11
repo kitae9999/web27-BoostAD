@@ -152,9 +152,15 @@ export type AuctionTransitionResult = {
   outcome:
     | 'committed'
     | 'released'
+    | 'duplicate_released'
     | 'already_committed'
     | 'already_released'
     | 'expired'
     | 'not_found';
   reservation?: AuctionReservation;
+};
+
+export type AuctionClickCommitGuard = {
+  dedupKey: string;
+  dedupTtlSeconds: number;
 };

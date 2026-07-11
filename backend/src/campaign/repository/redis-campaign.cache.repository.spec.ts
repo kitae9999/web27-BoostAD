@@ -218,6 +218,67 @@ describe('RedisCampaignCacheRepository winner-only reservation', () => {
     );
   });
 
+  it('maps a cross-auction duplicate click to a released reservation', async () => {
+    const reservation = {
+      auctionId: 'auction-duplicate',
+      requestFingerprint: 'fingerprint',
+      campaignId: 'campaign-1',
+      blogId: 7,
+      reservedAmount: 20,
+      budgetDate: '2026-07-11',
+      status: 'RELEASED',
+      createdAt: 1000,
+      updatedAt: 2000,
+      expiresAt: 3000,
+    };
+    const redis = {
+      get: jest
+        .fn()
+        .mockResolvedValue(
+          JSON.stringify({ ...reservation, status: 'RESERVED' })
+        ),
+      eval: jest.fn().mockResolvedValue([-3, JSON.stringify(reservation)]),
+    } as unknown as AppIORedisClient & {
+      get: jest.Mock;
+      eval: jest.Mock;
+    };
+    const config = {
+      get: jest.fn((_key: string, defaultValue: number) => defaultValue),
+    } as unknown as ConfigService;
+    const repository = new RedisCampaignCacheRepository(
+      redis,
+      config,
+      new EventEmitter2()
+    );
+
+    await expect(
+      repository.commitAuction('auction-duplicate', '2026-07-11', 1800, {
+        dedupKey: 'dedup:click:window:normal:test',
+        dedupTtlSeconds: 900,
+      })
+    ).resolves.toEqual({
+      outcome: 'duplicate_released',
+      reservation,
+    });
+    expect(redis.eval).toHaveBeenCalledWith(
+      expect.any(String),
+      8,
+      'rtb:reservation:auction-duplicate',
+      'rtb:reservation:expirations',
+      'rtb:budget:daily-reserved:2026-07-11',
+      'rtb:budget:total-reserved',
+      'rtb:budget:daily-exhausted-campaigns',
+      'rtb:budget:total-exhausted-campaigns',
+      'campaign:campaign-1',
+      'dedup:click:window:normal:test',
+      'auction-duplicate',
+      '2026-07-11',
+      '1800',
+      expect.any(String),
+      '900'
+    );
+  });
+
   it('returns null when no campaign in the window is reservable', async () => {
     const { repository } = buildRepository([0, 2]);
 

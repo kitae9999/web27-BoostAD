@@ -137,22 +137,62 @@ describe('SdkService reservation lifecycle', () => {
       .mockResolvedValueOnce(true);
 
     await expect(
-      harness.service.recordClick({
-        viewId: 101,
-        blogKey: 'blog-key',
-        postUrl: 'https://example.com/post',
-      })
+      harness.service.recordClick(
+        {
+          viewId: 101,
+          blogKey: 'blog-key',
+          postUrl: 'https://example.com/post',
+        },
+        'visitor'
+      )
     ).resolves.toBe(201);
     await expect(
-      harness.service.recordClick({
-        viewId: 101,
-        blogKey: 'blog-key',
-        postUrl: 'https://example.com/post',
-      })
+      harness.service.recordClick(
+        {
+          viewId: 101,
+          blogKey: 'blog-key',
+          postUrl: 'https://example.com/post',
+        },
+        'visitor'
+      )
     ).resolves.toBeNull();
 
     expect(harness.logRepository.saveClickLog).toHaveBeenCalledTimes(1);
     expect(harness.campaignRepository.incrementSpent).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases a fresh auction and skips billing for a repeated visitor/post/intent click', async () => {
+    const harness = createHarness();
+    harness.campaignCacheRepository.commitAuction.mockResolvedValue({
+      outcome: 'duplicate_released',
+      reservation: { ...reservation, status: 'RELEASED' },
+    });
+
+    await expect(
+      harness.service.recordClick(
+        {
+          viewId: 101,
+          blogKey: 'blog-key',
+          postUrl: 'https://forged.example/ignored',
+        },
+        'visitor'
+      )
+    ).resolves.toBeNull();
+
+    expect(harness.campaignCacheRepository.commitAuction).toHaveBeenCalledWith(
+      auctionId,
+      '2026-07-11',
+      1800,
+      expect.objectContaining({
+        dedupKey: expect.stringContaining('dedup:click:window:normal:post:'),
+        dedupTtlSeconds: 900,
+      })
+    );
+    expect(
+      harness.cacheRepository.setClickIdempotencyKey
+    ).not.toHaveBeenCalled();
+    expect(harness.logRepository.saveClickLog).not.toHaveBeenCalled();
+    expect(harness.campaignRepository.incrementSpent).not.toHaveBeenCalled();
   });
 
   it('releases on dismiss and rejects a click after release', async () => {
@@ -172,11 +212,14 @@ describe('SdkService reservation lifecycle', () => {
       outcome: 'released',
     });
     await expect(
-      harness.service.recordClick({
-        viewId: 101,
-        blogKey: 'blog-key',
-        postUrl: 'https://example.com/post',
-      })
+      harness.service.recordClick(
+        {
+          viewId: 101,
+          blogKey: 'blog-key',
+          postUrl: 'https://example.com/post',
+        },
+        'visitor'
+      )
     ).resolves.toBeNull();
     expect(harness.logRepository.saveClickLog).not.toHaveBeenCalled();
   });

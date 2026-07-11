@@ -1,4 +1,5 @@
 import {
+  AuctionClickCommitGuard,
   BudgetReservationCandidate,
   BudgetReservationResult,
   AuctionReservation,
@@ -65,7 +66,8 @@ export abstract class CampaignCacheRepository {
   abstract commitAuction(
     auctionId: string,
     currentBudgetDate: string,
-    terminalTtlSeconds: number
+    terminalTtlSeconds: number,
+    clickGuard: AuctionClickCommitGuard
   ): Promise<AuctionTransitionResult>;
 
   abstract releaseAuction(

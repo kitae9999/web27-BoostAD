@@ -8,6 +8,7 @@ import {
   BudgetReservationCandidate,
   BudgetReservationResult,
   AuctionReservation,
+  AuctionClickCommitGuard,
   AuctionTransitionResult,
   CachedCampaign,
   CachedCampaignWithoutSpent,
@@ -516,12 +517,16 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   async commitAuction(
     auctionId: string,
     currentBudgetDate: string,
-    terminalTtlSeconds: number
+    terminalTtlSeconds: number,
+    clickGuard: AuctionClickCommitGuard
   ): Promise<AuctionTransitionResult> {
     const reservation = await this.getAuctionReservation(auctionId);
     if (!reservation) return { outcome: 'not_found' };
 
-    const keys = this.getAuctionTransitionKeys(reservation);
+    const keys = [
+      ...this.getAuctionTransitionKeys(reservation),
+      clickGuard.dedupKey,
+    ];
     const result = (await this.ioredisClient.eval(
       REDIS_COMMIT_AUCTION_SCRIPT,
       keys.length,
@@ -529,7 +534,8 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       auctionId,
       currentBudgetDate,
       String(terminalTtlSeconds),
-      String(Date.now())
+      String(Date.now()),
+      String(clickGuard.dedupTtlSeconds)
     )) as [number, string];
     return this.mapAuctionTransition(result, 'commit');
   }
@@ -921,6 +927,11 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       if (code === -2)
         return {
           outcome: 'expired',
+          ...(reservation ? { reservation } : {}),
+        };
+      if (code === -3)
+        return {
+          outcome: 'duplicate_released',
           ...(reservation ? { reservation } : {}),
         };
       return {

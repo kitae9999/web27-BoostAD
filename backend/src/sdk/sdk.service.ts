@@ -17,12 +17,14 @@ import { UserRepository } from 'src/user/repository/user.repository.interface';
 import { UserRole } from 'src/user/entities/user.entity';
 import { ConfigService } from '@nestjs/config';
 import { MetricsService } from 'src/metrics/metrics.service';
+import { buildClickAbuseDedupKey } from './click-abuse-key.util';
 
 @Injectable()
 export class SdkService {
   private readonly logger = new Logger(SdkService.name);
   private readonly reservationLifecycleEnabled: boolean;
   private readonly reservationResultTtlSeconds: number;
+  private readonly clickAbuseWindowSeconds: number;
 
   constructor(
     private readonly logRepository: LogRepository,
@@ -40,6 +42,10 @@ export class SdkService {
     this.reservationResultTtlSeconds = this.getPositiveIntConfig(
       'RTB_AUCTION_RESULT_TTL_SECONDS',
       30 * 60
+    );
+    this.clickAbuseWindowSeconds = this.getPositiveIntConfig(
+      'RTB_CLICK_ABUSE_WINDOW_SECONDS',
+      15 * 60
     );
   }
 
@@ -195,11 +201,14 @@ export class SdkService {
     return viewId;
   }
 
-  async recordClick(dto: CreateClickLogDto): Promise<number | null> {
+  async recordClick(
+    dto: CreateClickLogDto,
+    visitorId: string
+  ): Promise<number | null> {
     const { viewId } = dto;
 
     if (this.reservationLifecycleEnabled) {
-      return this.recordReservationClick(viewId);
+      return this.recordReservationClick(viewId, visitorId);
     }
 
     const exists = await this.logRepository.existsByViewId(viewId);
@@ -247,7 +256,10 @@ export class SdkService {
     return this.persistClickAndRevenue(viewId);
   }
 
-  private async recordReservationClick(viewId: number): Promise<number | null> {
+  private async recordReservationClick(
+    viewId: number,
+    visitorId: string
+  ): Promise<number | null> {
     const viewLog = await this.logRepository.getViewLog(viewId);
     if (!viewLog) {
       throw new BadRequestException('잘못된 요청입니다.');
@@ -255,12 +267,26 @@ export class SdkService {
     const transition = await this.campaignCacheRepository.commitAuction(
       viewLog.auctionId,
       this.getKstBudgetDate(Date.now()),
-      this.reservationResultTtlSeconds
+      this.reservationResultTtlSeconds,
+      {
+        dedupKey: buildClickAbuseDedupKey({
+          visitorId,
+          postUrl: viewLog.postUrl ?? '',
+          isHighIntent: viewLog.isHighIntent,
+        }),
+        dedupTtlSeconds: this.clickAbuseWindowSeconds,
+      }
     );
     this.metricsService.recordRtbAuctionTransition(
       'commit',
       transition.outcome
     );
+    if (transition.outcome === 'duplicate_released') {
+      this.logger.debug(
+        `[SDK ClickLog] 반복 클릭 예약 해제: auctionId=${viewLog.auctionId}`
+      );
+      return null;
+    }
     if (
       transition.outcome !== 'committed' &&
       transition.outcome !== 'already_committed'
