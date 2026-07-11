@@ -446,6 +446,11 @@ describe('RTBService winner-only reservation', () => {
     expect(first.data?.auctionId).toBe(auctionId);
     expect(replay.data?.campaign.id).toBe(candidate.id);
     expect(reserveAuction).toHaveBeenCalledTimes(2);
+    expect(harness.metricMocks.recordRtbStage).toHaveBeenCalledWith(
+      'reserve',
+      'ok',
+      expect.any(Number)
+    );
     expect(harness.bidlogAdd).toHaveBeenCalledTimes(1);
     expect(harness.setAuctionData).not.toHaveBeenCalled();
   });

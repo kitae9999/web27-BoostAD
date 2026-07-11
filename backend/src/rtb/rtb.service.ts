@@ -254,18 +254,20 @@ export class RTBService {
     for (let start = 0; start < ranked.candidates.length; start += this.TOP_K) {
       attemptedWindowCount += 1;
       const window = ranked.candidates.slice(start, start + this.TOP_K);
-      const result = await this.campaignCacheRepository.reserveAuction({
-        auctionId,
-        requestFingerprint,
-        blogId,
-        budgetDate,
-        expiresAt,
-        resultTtlSeconds: this.reservationResultTtlSeconds,
-        candidates: window.map((candidate) => ({
-          campaignId: candidate.id,
-          cpc: candidate.maxCpc,
-        })),
-      });
+      const result = await this.measureStage('reserve', () =>
+        this.campaignCacheRepository.reserveAuction({
+          auctionId,
+          requestFingerprint,
+          blogId,
+          budgetDate,
+          expiresAt,
+          resultTtlSeconds: this.reservationResultTtlSeconds,
+          candidates: window.map((candidate) => ({
+            campaignId: candidate.id,
+            cpc: candidate.maxCpc,
+          })),
+        })
+      );
       this.metricsService.recordRtbAuctionTransition('reserve', result.outcome);
       attemptedCandidateCount += result.attemptedCount;
 
