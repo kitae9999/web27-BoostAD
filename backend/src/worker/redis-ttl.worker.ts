@@ -22,6 +22,8 @@ export class RedisTTLWorker implements OnModuleInit, OnModuleDestroy {
   private readonly reservationLifecycleEnabled: boolean;
   private readonly reservationSweepIntervalMs: number;
   private readonly reservationSweepBatchSize: number;
+  private readonly reservationSweepTimeBudgetMs: number;
+  private readonly reservationSweepMaxBatches: number;
   private readonly reservationResultTtlSeconds: number;
 
   constructor(
@@ -40,6 +42,14 @@ export class RedisTTLWorker implements OnModuleInit, OnModuleDestroy {
     this.reservationSweepBatchSize = this.getPositiveIntConfig(
       'RTB_RESERVATION_SWEEP_BATCH_SIZE',
       100
+    );
+    this.reservationSweepTimeBudgetMs = this.getPositiveIntConfig(
+      'RTB_RESERVATION_SWEEP_TIME_BUDGET_MS',
+      200
+    );
+    this.reservationSweepMaxBatches = this.getPositiveIntConfig(
+      'RTB_RESERVATION_SWEEP_MAX_BATCHES',
+      10
     );
     this.reservationResultTtlSeconds = this.getPositiveIntConfig(
       'RTB_AUCTION_RESULT_TTL_SECONDS',
@@ -95,35 +105,54 @@ export class RedisTTLWorker implements OnModuleInit, OnModuleDestroy {
     this.reservationSweepRunning = true;
 
     try {
-      const auctionIds =
-        await this.campaignCacheRepository.findExpiredAuctionIds(
-          Date.now(),
-          this.reservationSweepBatchSize
-        );
-      if (auctionIds.length === 0) return;
+      const startedAt = Date.now();
+      let batchCount = 0;
+      let scanned = 0;
+      let released = 0;
+      let failed = 0;
 
-      const results = await Promise.allSettled(
-        auctionIds.map((auctionId) =>
-          this.campaignCacheRepository.releaseAuction(
-            auctionId,
-            this.reservationResultTtlSeconds
+      while (
+        batchCount < this.reservationSweepMaxBatches &&
+        Date.now() - startedAt < this.reservationSweepTimeBudgetMs
+      ) {
+        const auctionIds =
+          await this.campaignCacheRepository.findExpiredAuctionIds(
+            Date.now(),
+            this.reservationSweepBatchSize
+          );
+        if (auctionIds.length === 0) break;
+
+        batchCount += 1;
+        scanned += auctionIds.length;
+        const results = await Promise.allSettled(
+          auctionIds.map((auctionId) =>
+            this.campaignCacheRepository.releaseAuction(
+              auctionId,
+              this.reservationResultTtlSeconds
+            )
           )
-        )
-      );
-      const failed = results.filter(
-        (result) => result.status === 'rejected'
-      ).length;
-      const released = results.filter(
-        (result) =>
-          result.status === 'fulfilled' && result.value.outcome === 'released'
-      ).length;
+        );
+        failed += results.filter(
+          (result) => result.status === 'rejected'
+        ).length;
+        released += results.filter(
+          (result) =>
+            result.status === 'fulfilled' && result.value.outcome === 'released'
+        ).length;
+
+        if (auctionIds.length < this.reservationSweepBatchSize) break;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+
+      if (scanned === 0) return;
+      const elapsedMs = Date.now() - startedAt;
       if (failed > 0) {
         this.logger.error(
-          `[Reservation Sweep] 일부 회수 실패: scanned=${auctionIds.length}, released=${released}, failed=${failed}`
+          `[Reservation Sweep] 일부 회수 실패: batches=${batchCount}, scanned=${scanned}, released=${released}, failed=${failed}, elapsed=${elapsedMs}ms`
         );
       } else {
         this.logger.debug(
-          `[Reservation Sweep] 만료 예약 회수: scanned=${auctionIds.length}, released=${released}`
+          `[Reservation Sweep] 만료 예약 회수: batches=${batchCount}, scanned=${scanned}, released=${released}, elapsed=${elapsedMs}ms`
         );
       }
     } catch (error) {
@@ -140,7 +169,7 @@ export class RedisTTLWorker implements OnModuleInit, OnModuleDestroy {
     this.reservationSweepTimer.unref?.();
     void this.sweepExpiredReservations();
     this.logger.log(
-      `Auction reservation 만료 회수 시작: interval=${this.reservationSweepIntervalMs}ms, batch=${this.reservationSweepBatchSize}`
+      `Auction reservation 만료 회수 시작: interval=${this.reservationSweepIntervalMs}ms, batch=${this.reservationSweepBatchSize}, timeBudget=${this.reservationSweepTimeBudgetMs}ms, maxBatches=${this.reservationSweepMaxBatches}`
     );
   }
 

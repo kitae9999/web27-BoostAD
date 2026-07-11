@@ -539,7 +539,10 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
     terminalTtlSeconds: number
   ): Promise<AuctionTransitionResult> {
     const reservation = await this.getAuctionReservation(auctionId);
-    if (!reservation) return { outcome: 'not_found' };
+    if (!reservation) {
+      await this.ioredisClient.zrem(AUCTION_RESERVATION_EXPIRATIONS, auctionId);
+      return { outcome: 'not_found' };
+    }
 
     const keys = this.getAuctionTransitionKeys(reservation);
     const result = (await this.ioredisClient.eval(

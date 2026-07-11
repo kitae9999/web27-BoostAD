@@ -5,7 +5,7 @@ import type { AppIORedisClient } from 'src/redis/redis.type';
 import { RedisTTLWorker } from './redis-ttl.worker';
 
 describe('RedisTTLWorker reservation sweep', () => {
-  const createWorker = () => {
+  const createWorker = (configOverrides: Record<string, string> = {}) => {
     const subscriber = {
       subscribe: jest.fn().mockResolvedValue(undefined),
       unsubscribe: jest.fn().mockResolvedValue(undefined),
@@ -28,7 +28,10 @@ describe('RedisTTLWorker reservation sweep', () => {
           RTB_BUDGET_MODE: 'reservation_lifecycle',
           RTB_RESERVATION_SWEEP_INTERVAL_MS: '1000',
           RTB_RESERVATION_SWEEP_BATCH_SIZE: '20',
+          RTB_RESERVATION_SWEEP_TIME_BUDGET_MS: '200',
+          RTB_RESERVATION_SWEEP_MAX_BATCHES: '10',
           RTB_AUCTION_RESULT_TTL_SECONDS: '1800',
+          ...configOverrides,
         };
         return values[key];
       }),
@@ -61,6 +64,60 @@ describe('RedisTTLWorker reservation sweep', () => {
       'auction-2',
       1800
     );
+  });
+
+  it('drains consecutive full batches until the backlog becomes smaller than a batch', async () => {
+    const { worker, campaignCacheRepository } = createWorker();
+    const first = Array.from({ length: 20 }, (_, index) => `first-${index}`);
+    const second = Array.from({ length: 20 }, (_, index) => `second-${index}`);
+    campaignCacheRepository.findExpiredAuctionIds
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(second)
+      .mockResolvedValueOnce(['last']);
+
+    await worker.sweepExpiredReservations();
+
+    expect(campaignCacheRepository.findExpiredAuctionIds).toHaveBeenCalledTimes(
+      3
+    );
+    expect(campaignCacheRepository.releaseAuction).toHaveBeenCalledTimes(41);
+  });
+
+  it('stops draining when the configured time budget is exhausted', async () => {
+    const { worker, campaignCacheRepository } = createWorker({
+      RTB_RESERVATION_SWEEP_TIME_BUDGET_MS: '100',
+    });
+    campaignCacheRepository.findExpiredAuctionIds.mockResolvedValue(
+      Array.from({ length: 20 }, (_, index) => `auction-${index}`)
+    );
+    let now = -60;
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => {
+      now += 60;
+      return now;
+    });
+
+    await worker.sweepExpiredReservations();
+
+    expect(campaignCacheRepository.findExpiredAuctionIds).toHaveBeenCalledTimes(
+      1
+    );
+    nowSpy.mockRestore();
+  });
+
+  it('also caps a drain by maximum batch count', async () => {
+    const { worker, campaignCacheRepository } = createWorker({
+      RTB_RESERVATION_SWEEP_MAX_BATCHES: '2',
+    });
+    campaignCacheRepository.findExpiredAuctionIds.mockResolvedValue(
+      Array.from({ length: 20 }, (_, index) => `auction-${index}`)
+    );
+
+    await worker.sweepExpiredReservations();
+
+    expect(campaignCacheRepository.findExpiredAuctionIds).toHaveBeenCalledTimes(
+      2
+    );
+    expect(campaignCacheRepository.releaseAuction).toHaveBeenCalledTimes(40);
   });
 
   it('does not start an overlapping sweep while the previous scan is pending', async () => {

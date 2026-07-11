@@ -192,6 +192,32 @@ describe('RedisCampaignCacheRepository winner-only reservation', () => {
     ).resolves.toMatchObject({ outcome: 'conflict', attemptedCount: 0 });
   });
 
+  it('removes an orphan expiration entry when its reservation no longer exists', async () => {
+    const redis = {
+      get: jest.fn().mockResolvedValue(null),
+      zrem: jest.fn().mockResolvedValue(1),
+    } as unknown as AppIORedisClient & {
+      get: jest.Mock;
+      zrem: jest.Mock;
+    };
+    const config = {
+      get: jest.fn((_key: string, defaultValue: number) => defaultValue),
+    } as unknown as ConfigService;
+    const repository = new RedisCampaignCacheRepository(
+      redis,
+      config,
+      new EventEmitter2()
+    );
+
+    await expect(repository.releaseAuction('orphan', 1800)).resolves.toEqual({
+      outcome: 'not_found',
+    });
+    expect(redis.zrem).toHaveBeenCalledWith(
+      'rtb:reservation:expirations',
+      'orphan'
+    );
+  });
+
   it('returns null when no campaign in the window is reservable', async () => {
     const { repository } = buildRepository([0, 2]);
 
