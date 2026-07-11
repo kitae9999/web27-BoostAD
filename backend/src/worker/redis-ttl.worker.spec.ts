@@ -3,6 +3,7 @@ import { CacheRepository } from 'src/cache/repository/cache.repository.interface
 import { CampaignCacheRepository } from 'src/campaign/repository/campaign.cache.repository.interface';
 import type { AppIORedisClient } from 'src/redis/redis.type';
 import { RedisTTLWorker } from './redis-ttl.worker';
+import { MetricsService } from 'src/metrics/metrics.service';
 
 describe('RedisTTLWorker reservation sweep', () => {
   const createWorker = () => {
@@ -37,6 +38,9 @@ describe('RedisTTLWorker reservation sweep', () => {
       redis,
       {} as CacheRepository,
       campaignCacheRepository,
+      {
+        recordRtbAuctionTransition: jest.fn(),
+      } as unknown as MetricsService,
       configService
     );
 

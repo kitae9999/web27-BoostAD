@@ -16,6 +16,9 @@ describe('MetricsService', () => {
     };
 
     const service = new MetricsService(queue as never);
+    service.recordRtbAuctionTransition('reserve', 'reserved');
+    service.recordRtbAuctionTransition('reserve', 'replayed');
+    service.recordRtbAuctionTransition('timeout_release', 'released');
 
     const metrics = await service.getMetrics();
 
@@ -36,6 +39,12 @@ describe('MetricsService', () => {
     );
     expect(metrics).toContain(
       'boostad_queue_jobs{queue="bidlog-queue",state="failed"} 3'
+    );
+    expect(metrics).toContain(
+      'boostad_rtb_auction_transition_total{operation="reserve",outcome="reserved"} 1'
+    );
+    expect(metrics).toContain(
+      'boostad_rtb_auction_transition_total{operation="timeout_release",outcome="released"} 1'
     );
   });
 });

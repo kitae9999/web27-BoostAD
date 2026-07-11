@@ -266,6 +266,7 @@ export class RTBService {
           cpc: candidate.maxCpc,
         })),
       });
+      this.metricsService.recordRtbAuctionTransition('reserve', result.outcome);
       attemptedCandidateCount += result.attemptedCount;
 
       if (result.outcome === 'conflict') {

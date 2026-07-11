@@ -16,6 +16,7 @@ import { BlogRepository } from 'src/blog/repository/blog.repository.interface';
 import { UserRepository } from 'src/user/repository/user.repository.interface';
 import { UserRole } from 'src/user/entities/user.entity';
 import { ConfigService } from '@nestjs/config';
+import { MetricsService } from 'src/metrics/metrics.service';
 
 @Injectable()
 export class SdkService {
@@ -30,6 +31,7 @@ export class SdkService {
     private readonly campaignRepository: CampaignRepository,
     private readonly blogRepository: BlogRepository,
     private readonly userRepository: UserRepository,
+    private readonly metricsService: MetricsService,
     private readonly configService: ConfigService
   ) {
     this.reservationLifecycleEnabled =
@@ -255,6 +257,10 @@ export class SdkService {
       this.getKstBudgetDate(Date.now()),
       this.reservationResultTtlSeconds
     );
+    this.metricsService.recordRtbAuctionTransition(
+      'commit',
+      transition.outcome
+    );
     if (
       transition.outcome !== 'committed' &&
       transition.outcome !== 'already_committed'
@@ -340,6 +346,10 @@ export class SdkService {
       const transition = await this.campaignCacheRepository.releaseAuction(
         viewLog.auctionId,
         this.reservationResultTtlSeconds
+      );
+      this.metricsService.recordRtbAuctionTransition(
+        'dismiss_release',
+        transition.outcome
       );
       this.logger.debug(
         `[SDK Dismiss] auction release: auctionId=${viewLog.auctionId}, outcome=${transition.outcome}`

@@ -14,6 +14,7 @@ type RtbStageLabel = 'stage' | 'outcome';
 type RtbRequestLabel = 'result' | 'high_intent';
 type RtbFallbackLabel = 'reason';
 type RtbReservationFailureLabel = 'reason';
+type AuctionTransitionLabel = 'operation' | 'outcome';
 type RtbPayloadLabel = 'direction';
 type DependencyLabel = 'dependency' | 'operation' | 'outcome';
 type BidLogPubSubMessageLabel = 'result';
@@ -111,6 +112,14 @@ export class MetricsService {
     buckets: [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000],
     registers: [this.registry],
   });
+
+  private readonly rtbAuctionTransitionTotal =
+    new Counter<AuctionTransitionLabel>({
+      name: 'boostad_rtb_auction_transition_total',
+      help: 'Auction reservation lifecycle transition count',
+      labelNames: ['operation', 'outcome'],
+      registers: [this.registry],
+    });
 
   private readonly rtbEligibleCampaignCount = new Histogram({
     name: 'boostad_rtb_eligible_campaign_count',
@@ -584,6 +593,10 @@ export class MetricsService {
       return;
     }
     this.rtbReservationFailuresTotal.inc({ reason }, count);
+  }
+
+  recordRtbAuctionTransition(operation: string, outcome: string) {
+    this.rtbAuctionTransitionTotal.inc({ operation, outcome });
   }
 
   observeRtbPayload(direction: 'request' | 'response', bytes: number) {

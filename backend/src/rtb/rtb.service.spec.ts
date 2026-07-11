@@ -54,6 +54,7 @@ type MetricMocks = {
   recordRtbStage: jest.Mock;
   observeRtbBidLogCount: jest.Mock;
   recordRtbRequest: jest.Mock;
+  recordRtbAuctionTransition: jest.Mock;
 };
 
 type Harness = {
@@ -485,6 +486,7 @@ function buildMetricsService(): {
     recordRtbStage: jest.fn(),
     observeRtbBidLogCount: jest.fn(),
     recordRtbRequest: jest.fn(),
+    recordRtbAuctionTransition: jest.fn(),
   };
   return {
     metricMocks,

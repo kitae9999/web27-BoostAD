@@ -8,6 +8,7 @@ import type { AuctionReservation } from 'src/campaign/types/campaign.types';
 import { LogRepository } from 'src/log/repository/log.repository.interface';
 import type { SaveViewLog } from 'src/log/types/log.type';
 import { UserRepository } from 'src/user/repository/user.repository.interface';
+import { MetricsService } from 'src/metrics/metrics.service';
 import { SdkService } from './sdk.service';
 
 describe('SdkService reservation lifecycle', () => {
@@ -67,6 +68,9 @@ describe('SdkService reservation lifecycle', () => {
         key === 'RTB_BUDGET_MODE' ? 'reservation_lifecycle' : undefined
       ),
     } as unknown as ConfigService;
+    const metricsService = {
+      recordRtbAuctionTransition: jest.fn(),
+    } as unknown as MetricsService;
 
     return {
       service: new SdkService(
@@ -76,6 +80,7 @@ describe('SdkService reservation lifecycle', () => {
         campaignRepository,
         blogRepository,
         userRepository,
+        metricsService,
         configService
       ),
       logRepository,

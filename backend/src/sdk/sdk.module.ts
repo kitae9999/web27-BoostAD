@@ -6,9 +6,17 @@ import { CacheModule } from 'src/cache/cache.module';
 import { BlogModule } from 'src/blog/blog.module';
 import { CampaignModule } from 'src/campaign/campaign.module';
 import { UserModule } from 'src/user/user.module';
+import { MetricsModule } from 'src/metrics/metrics.module';
 
 @Module({
-  imports: [LogModule, CacheModule, BlogModule, CampaignModule, UserModule],
+  imports: [
+    LogModule,
+    CacheModule,
+    BlogModule,
+    CampaignModule,
+    UserModule,
+    MetricsModule,
+  ],
   controllers: [SdkController],
   providers: [SdkService],
 })
