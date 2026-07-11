@@ -20,7 +20,7 @@ export class AdTracker {
   // ViewLog 기록
   async trackView(
     auctionId: string,
-    _campaignId: string,
+    campaignId: string,
     postUrl: string,
     behaviorScore: number,
     isHighIntent: boolean
@@ -29,6 +29,7 @@ export class AdTracker {
       const requestBody: ViewLogRequest = {
         blogKey: this.blogKey,
         auctionId,
+        campaignId,
         postUrl,
         isHighIntent,
         behaviorScore,
