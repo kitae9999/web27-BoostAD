@@ -5,6 +5,8 @@ import {
   IsNumber,
   IsOptional,
   IsBoolean,
+  IsUUID,
+  MaxLength,
   Matches,
   // ValidateNested,
   // Min,
@@ -33,6 +35,17 @@ import {
 // }
 
 export class RTBRequestDto {
+  @Expose()
+  @IsOptional()
+  @IsUUID()
+  auctionId?: string;
+
+  @Expose()
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  placementId?: string;
+
   @Expose()
   @IsString()
   blogKey: string;

@@ -19,6 +19,8 @@ export interface Campaign {
   deleted_at: string | null;
 }
 export interface DecisionContext {
+  auctionId?: string;
+  placementId?: string;
   blogKey: string;
   blogId: number; // Guard에서 가져온 값 (중복 조회 방지)
   blogName: string; // Guard에서 가져온 값 (SSE 이벤트 DB 조회 제거용)

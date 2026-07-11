@@ -70,6 +70,9 @@ export class BoostAdSDK {
     isHighIntent: boolean
   ): Promise<void> {
     try {
+      // 한 광고 슬롯의 렌더링 시도마다 한 번 생성한다. API client가 내부에서
+      // 재시도하더라도 같은 auctionId를 사용해야 중복 예약되지 않는다.
+      const auctionId = crypto.randomUUID();
       // decision에는 observe에서 받은 contextId를 같이 넘긴다.
       // READY면 semantic path, PENDING/없음이면 서버가 lexical/tag로 fallback.
       const data = await this.apiClient.fetchDecision(
@@ -77,7 +80,9 @@ export class BoostAdSDK {
         postUrl,
         behaviorScore,
         isHighIntent,
-        this.contextId
+        this.contextId,
+        auctionId,
+        container.id
       );
 
       // 광고 후보가 없는 경우 처리 (아무것도 표시하지 않음)

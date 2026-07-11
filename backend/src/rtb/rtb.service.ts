@@ -6,7 +6,7 @@ import type {
   ScoredCandidate,
   SelectionResult,
 } from './types/decision.types';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { CacheRepository } from '../cache/repository/cache.repository.interface';
 import { BidStatus } from '../bid-log/bid-log.types';
 import { CampaignCacheRepository } from '../campaign/repository/campaign.cache.repository.interface';
@@ -20,7 +20,8 @@ import { Queue } from 'bullmq';
 import { BidLogJobData } from '../queue/types/queue.type';
 import { ConfigService } from '@nestjs/config';
 
-type BudgetMode = 'legacy_topk' | 'winner_only';
+type BudgetMode = 'legacy_topk' | 'winner_only' | 'reservation_lifecycle';
+type ReservationSelectionResult = SelectionResult & { replayed: boolean };
 
 @Injectable()
 export class RTBService {
@@ -30,6 +31,8 @@ export class RTBService {
     'c1dda7a5-da58-416b-b8fa-20ba8f5535f9';
   private readonly TOP_K = 10;
   private readonly budgetMode: BudgetMode;
+  private readonly reservationTtlMs: number;
+  private readonly reservationResultTtlSeconds: number;
 
   constructor(
     private readonly matcher: Matcher,
@@ -44,6 +47,14 @@ export class RTBService {
     this.budgetMode = this.resolveBudgetMode(
       this.configService.get<string>('RTB_BUDGET_MODE', 'legacy_topk')
     );
+    this.reservationTtlMs = this.getPositiveIntConfig(
+      'RTB_AUCTION_RESERVATION_TTL_MS',
+      15 * 60 * 1000
+    );
+    this.reservationResultTtlSeconds = this.getPositiveIntConfig(
+      'RTB_AUCTION_RESULT_TTL_SECONDS',
+      30 * 60
+    );
   }
 
   async runAuction(context: DecisionContext) {
@@ -53,7 +64,10 @@ export class RTBService {
     let fallbackUsed = false;
 
     try {
-      const auctionId = randomUUID();
+      const auctionId =
+        this.budgetMode === 'reservation_lifecycle'
+          ? (context.auctionId ?? randomUUID())
+          : randomUUID();
 
       // 0. blogId는 Guard에서 이미 검증됨 (중복 조회 제거)
       const blogId = context.blogId;
@@ -105,20 +119,32 @@ export class RTBService {
         candidates.length
       );
 
-      const result =
-        this.budgetMode === 'winner_only'
+      const reservationResult =
+        this.budgetMode === 'reservation_lifecycle'
+          ? await this.runReservationLifecycle(
+              auctionId,
+              this.createRequestFingerprint(context),
+              blogId,
+              candidates
+            )
+          : null;
+      const result = reservationResult
+        ? reservationResult
+        : this.budgetMode === 'winner_only'
           ? await this.runWinnerOnlyReservation(candidates)
           : await this.runLegacyTopKReservation(auctionId, candidates);
 
       // 6. AuctionStore에 경매 데이터 저장 (ViewLog에서 조회용)
-      await this.measureStage('cache_auction', () =>
-        this.measureDependency('redis', 'set_auction_data', () =>
-          this.cacheRepository.setAuctionData(auctionId, {
-            blogId: blogId,
-            cost: result.winner.maxCpc,
-          })
-        )
-      );
+      if (this.budgetMode !== 'reservation_lifecycle') {
+        await this.measureStage('cache_auction', () =>
+          this.measureDependency('redis', 'set_auction_data', () =>
+            this.cacheRepository.setAuctionData(auctionId, {
+              blogId: blogId,
+              cost: result.winner.maxCpc,
+            })
+          )
+        );
+      }
 
       const bidLogJob: BidLogJobData = {
         auctionId,
@@ -141,7 +167,9 @@ export class RTBService {
       };
 
       this.metricsService.observeRtbBidLogCount(bidLogJob.items.length);
-      await this.bidlogQueue.add('save-bidlog', bidLogJob);
+      if (!reservationResult?.replayed) {
+        await this.bidlogQueue.add('save-bidlog', bidLogJob);
+      }
 
       requestResult = fallbackUsed ? 'fallback' : 'success';
       totalOutcome = fallbackUsed ? 'fallback' : 'ok';
@@ -208,6 +236,86 @@ export class RTBService {
 
     this.metricsService.observeRtbRollbackCandidateCount(0);
     return { winner, candidates: [winner] };
+  }
+
+  private async runReservationLifecycle(
+    auctionId: string,
+    requestFingerprint: string,
+    blogId: number,
+    candidates: ScoredCandidate[]
+  ): Promise<ReservationSelectionResult> {
+    const ranked = await this.measureStage('select', () =>
+      this.selector.selectWinner(candidates)
+    );
+    const { budgetDate, expiresAt } = this.getReservationWindow(Date.now());
+    let attemptedCandidateCount = 0;
+    let attemptedWindowCount = 0;
+
+    for (let start = 0; start < ranked.candidates.length; start += this.TOP_K) {
+      attemptedWindowCount += 1;
+      const window = ranked.candidates.slice(start, start + this.TOP_K);
+      const result = await this.campaignCacheRepository.reserveAuction({
+        auctionId,
+        requestFingerprint,
+        blogId,
+        budgetDate,
+        expiresAt,
+        resultTtlSeconds: this.reservationResultTtlSeconds,
+        candidates: window.map((candidate) => ({
+          campaignId: candidate.id,
+          cpc: candidate.maxCpc,
+        })),
+      });
+      attemptedCandidateCount += result.attemptedCount;
+
+      if (result.outcome === 'conflict') {
+        throw new Error('auctionId가 다른 Decision 요청에 이미 사용됐습니다');
+      }
+      if (result.outcome === 'exhausted') {
+        continue;
+      }
+      const reservation = result.reservation;
+      if (!reservation) {
+        throw new Error('auction reservation 결과가 비어 있습니다');
+      }
+      if (reservation.status === 'RELEASED') {
+        throw new Error('이미 만료되거나 해제된 auction입니다');
+      }
+
+      let winner = ranked.candidates.find(
+        (candidate) => candidate.id === reservation.campaignId
+      );
+      if (!winner) {
+        const cached = await this.campaignCacheRepository.findCampaignCacheById(
+          reservation.campaignId
+        );
+        if (cached) {
+          winner = { ...cached, similarity: 0, score: 0 };
+        }
+      }
+      if (!winner) {
+        throw new Error('기존 auction winner 캠페인을 복원할 수 없습니다');
+      }
+
+      this.recordWinnerOnlyFanout(
+        attemptedWindowCount,
+        attemptedCandidateCount,
+        1
+      );
+      this.metricsService.observeRtbRollbackCandidateCount(0);
+      return {
+        winner,
+        candidates: [winner],
+        replayed: result.outcome === 'replayed',
+      };
+    }
+
+    this.recordWinnerOnlyFanout(
+      attemptedWindowCount,
+      attemptedCandidateCount,
+      0
+    );
+    throw new Error('예산 확보 가능한 캠페인이 없습니다');
   }
 
   private async runLegacyTopKReservation(
@@ -492,8 +600,11 @@ export class RTBService {
   }
 
   private resolveBudgetMode(configuredMode: string | undefined): BudgetMode {
-    if (configuredMode === 'winner_only') {
-      return 'winner_only';
+    if (
+      configuredMode === 'winner_only' ||
+      configuredMode === 'reservation_lifecycle'
+    ) {
+      return configuredMode;
     }
     if (configuredMode && configuredMode !== 'legacy_topk') {
       this.logger.warn(
@@ -501,5 +612,48 @@ export class RTBService {
       );
     }
     return 'legacy_topk';
+  }
+
+  private createRequestFingerprint(context: DecisionContext): string {
+    return createHash('sha256')
+      .update(
+        JSON.stringify({
+          blogId: context.blogId,
+          postUrl: context.postUrl,
+          placementId: context.placementId ?? 'default',
+          contextId: context.contextId ?? null,
+          tags: [
+            ...new Set(context.tags.map((tag) => tag.trim().toLowerCase())),
+          ]
+            .filter(Boolean)
+            .sort(),
+          behaviorScore: context.behaviorScore,
+          isHighIntent: context.isHighIntent,
+        })
+      )
+      .digest('hex');
+  }
+
+  private getReservationWindow(nowMs: number): {
+    budgetDate: string;
+    expiresAt: number;
+  } {
+    const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
+    const kstNow = new Date(nowMs + KST_OFFSET_MS);
+    const year = kstNow.getUTCFullYear();
+    const month = kstNow.getUTCMonth();
+    const day = kstNow.getUTCDate();
+    const budgetDate = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    const nextMidnightKst = Date.UTC(year, month, day + 1) - KST_OFFSET_MS;
+    return {
+      budgetDate,
+      expiresAt: Math.min(nowMs + this.reservationTtlMs, nextMidnightKst - 1),
+    };
+  }
+
+  private getPositiveIntConfig(name: string, defaultValue: number): number {
+    const raw = this.configService.get<string>(name);
+    const parsed = raw ? Number.parseInt(raw, 10) : defaultValue;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
   }
 }

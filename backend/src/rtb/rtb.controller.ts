@@ -80,6 +80,8 @@ export class RTBController {
     }
 
     const context: DecisionContext = {
+      auctionId: body.auctionId,
+      placementId: body.placementId,
       blogKey: body.blogKey,
       blogId: req.blog!.id, // Guard에서 이미 검증/조회한 blog 활용
       blogName: req.blog!.name, // Guard에서 조회한 blog name 전달 (SSE 이벤트용 DB 조회 제거)

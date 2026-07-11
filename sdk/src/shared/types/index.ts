@@ -23,6 +23,8 @@ export interface Campaign {
 
 // Decision API 요청 타입
 export interface DecisionRequest {
+  auctionId: string;
+  placementId: string;
   blogKey: string;
   tags: string[];
   postUrl: string;
@@ -113,7 +115,9 @@ export interface APIClient {
     postUrl: string,
     behaviorScore?: number,
     isHighIntent?: boolean,
-    contextId?: string
+    contextId?: string,
+    auctionId?: string,
+    placementId?: string
   ): Promise<DecisionResponse>;
   observeContext(
     tags: Tag[],

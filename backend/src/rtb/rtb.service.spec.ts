@@ -4,6 +4,8 @@ import { CampaignCacheRepository } from 'src/campaign/repository/campaign.cache.
 import type {
   BudgetReservationCandidate,
   BudgetReservationResult,
+  ReserveAuctionRequest,
+  ReserveAuctionResult,
 } from 'src/campaign/types/campaign.types';
 import { MetricsService } from 'src/metrics/metrics.service';
 import type { BidLogJobData } from 'src/queue/types/queue.type';
@@ -27,9 +29,15 @@ type IncrementSpentMock = jest.Mock<
   [string, number, number, number | null]
 >;
 
+type ReserveAuctionMock = jest.Mock<
+  Promise<ReserveAuctionResult>,
+  [ReserveAuctionRequest]
+>;
+
 type RepositoryMocks = {
   incrementSpent: IncrementSpentMock;
   reserveFirstAvailable: ReserveFirstAvailableMock;
+  reserveAuction: ReserveAuctionMock;
   decrementSpent: jest.Mock<Promise<void>, [string, number]>;
   findCampaignCacheById: jest.Mock;
 };
@@ -53,6 +61,7 @@ type Harness = {
   repositoryMocks: RepositoryMocks;
   metricMocks: MetricMocks;
   bidlogAdd: jest.Mock<Promise<void>, [string, BidLogJobData]>;
+  setAuctionData: jest.Mock;
 };
 
 describe('RTBService winner-only reservation', () => {
@@ -98,9 +107,10 @@ describe('RTBService winner-only reservation', () => {
   const buildHarness = (
     candidates: ScoredCandidate[],
     options: {
-      mode?: 'winner_only' | 'legacy_topk';
+      mode?: 'winner_only' | 'legacy_topk' | 'reservation_lifecycle';
       incrementSpent?: IncrementSpentMock;
       reserveFirstAvailable?: ReserveFirstAvailableMock;
+      reserveAuction?: ReserveAuctionMock;
     } = {}
   ): Harness => {
     const matcher = {
@@ -118,8 +128,9 @@ describe('RTBService winner-only reservation', () => {
         }
       ),
     } as unknown as CampaignSelector & { selectWinner: jest.Mock };
+    const setAuctionData = jest.fn().mockResolvedValue(undefined);
     const cacheRepository = {
-      setAuctionData: jest.fn().mockResolvedValue(undefined),
+      setAuctionData,
     } as unknown as CacheRepository & { setAuctionData: jest.Mock };
     const repositoryMocks: RepositoryMocks = {
       incrementSpent:
@@ -140,6 +151,27 @@ describe('RTBService winner-only reservation', () => {
               attemptedCount: 1,
             })
           ),
+      reserveAuction:
+        options.reserveAuction ??
+        jest.fn().mockImplementation((request: ReserveAuctionRequest) => {
+          const candidate = request.candidates[0];
+          return Promise.resolve({
+            outcome: 'reserved',
+            attemptedCount: 1,
+            reservation: {
+              auctionId: request.auctionId,
+              requestFingerprint: request.requestFingerprint,
+              campaignId: candidate.campaignId,
+              blogId: request.blogId,
+              reservedAmount: candidate.cpc,
+              budgetDate: request.budgetDate,
+              status: 'RESERVED',
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+              expiresAt: request.expiresAt,
+            },
+          });
+        }),
       decrementSpent: jest
         .fn<Promise<void>, [string, number]>()
         .mockResolvedValue(undefined),
@@ -173,6 +205,7 @@ describe('RTBService winner-only reservation', () => {
       repositoryMocks,
       metricMocks,
       bidlogAdd,
+      setAuctionData,
     };
   };
 
@@ -366,6 +399,73 @@ describe('RTBService winner-only reservation', () => {
       low.id,
       low.maxCpc
     );
+  });
+
+  it('replays the same auction winner without another reservation or bid log', async () => {
+    const candidate = buildCandidate('winner', 100);
+    const auctionId = '123e4567-e89b-42d3-a456-426614174000';
+    let storedReservation: ReserveAuctionResult['reservation'];
+    const reserveAuction = jest.fn(
+      async (request: ReserveAuctionRequest): Promise<ReserveAuctionResult> => {
+        if (storedReservation) {
+          return {
+            outcome: 'replayed',
+            reservation: storedReservation,
+            attemptedCount: 0,
+          };
+        }
+        storedReservation = {
+          auctionId,
+          requestFingerprint: request.requestFingerprint,
+          campaignId: candidate.id,
+          blogId: request.blogId,
+          reservedAmount: candidate.maxCpc,
+          budgetDate: request.budgetDate,
+          status: 'RESERVED',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          expiresAt: request.expiresAt,
+        };
+        return {
+          outcome: 'reserved',
+          reservation: storedReservation,
+          attemptedCount: 1,
+        };
+      }
+    );
+    const harness = buildHarness([candidate], {
+      mode: 'reservation_lifecycle',
+      reserveAuction,
+    });
+    const idempotentContext = { ...context, auctionId, placementId: 'top' };
+
+    const first = await harness.service.runAuction(idempotentContext);
+    const replay = await harness.service.runAuction(idempotentContext);
+
+    expect(first.data?.auctionId).toBe(auctionId);
+    expect(replay.data?.campaign.id).toBe(candidate.id);
+    expect(reserveAuction).toHaveBeenCalledTimes(2);
+    expect(harness.bidlogAdd).toHaveBeenCalledTimes(1);
+    expect(harness.setAuctionData).not.toHaveBeenCalled();
+  });
+
+  it('rejects reuse of an auction ID with another request fingerprint', async () => {
+    const candidate = buildCandidate('winner', 100);
+    const reserveAuction = jest
+      .fn<Promise<ReserveAuctionResult>, [ReserveAuctionRequest]>()
+      .mockResolvedValue({ outcome: 'conflict', attemptedCount: 0 });
+    const harness = buildHarness([candidate], {
+      mode: 'reservation_lifecycle',
+      reserveAuction,
+    });
+
+    const result = await harness.service.runAuction({
+      ...context,
+      auctionId: '123e4567-e89b-42d3-a456-426614174000',
+    });
+
+    expect(result.status).toBe('error');
+    expect(harness.bidlogAdd).not.toHaveBeenCalled();
   });
 });
 

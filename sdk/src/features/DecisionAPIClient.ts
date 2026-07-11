@@ -18,12 +18,16 @@ export class DecisionAPIClient implements APIClient {
     postUrl: string,
     behaviorScore: number = 0,
     isHighIntent: boolean = false,
-    contextId?: string
+    contextId?: string,
+    auctionId: string = crypto.randomUUID(),
+    placementId: string = 'default'
   ): Promise<DecisionResponse> {
     let requestBody: DecisionRequest;
 
     if (this.config.context) {
       requestBody = {
+        auctionId,
+        placementId,
         blogKey: this.config.blogKey,
         tags: [this.config.context],
         postUrl,
@@ -33,6 +37,8 @@ export class DecisionAPIClient implements APIClient {
       };
     } else {
       requestBody = {
+        auctionId,
+        placementId,
         blogKey: this.config.blogKey,
         tags: tags.map((tag) => tag.name),
         postUrl,
