@@ -358,12 +358,35 @@ export const REDIS_RELEASE_AUCTION_SCRIPT = `
   end
   decrementHash(KEYS[3])
   decrementHash(KEYS[4])
+
+  local dailyBudgetRaw = redis.call('JSON.GET', KEYS[7], '$.dailyBudget')
+  local totalBudgetRaw = redis.call('JSON.GET', KEYS[7], '$.totalBudget')
+  local dailySpentRaw = redis.call('JSON.GET', KEYS[7], '$.dailySpent')
+  local totalSpentRaw = redis.call('JSON.GET', KEYS[7], '$.totalSpent')
+  local maxCpcRaw = redis.call('JSON.GET', KEYS[7], '$.maxCpc')
+  local dailyBudget = dailyBudgetRaw and tonumber(string.match(dailyBudgetRaw, '%[([%d%.]+)%]'))
+  local totalBudget = totalBudgetRaw and tonumber(string.match(totalBudgetRaw, '%[([%d%.]+)%]'))
+  local dailySpent = dailySpentRaw and tonumber(string.match(dailySpentRaw, '%[([%d%.]+)%]')) or 0
+  local totalSpent = totalSpentRaw and tonumber(string.match(totalSpentRaw, '%[([%d%.]+)%]')) or 0
+  local maxCpc = maxCpcRaw and tonumber(string.match(maxCpcRaw, '%[([%d%.]+)%]')) or amount
+  local dailyReserved = tonumber(redis.call('HGET', KEYS[3], campaignId)) or 0
+  local totalReserved = tonumber(redis.call('HGET', KEYS[4], campaignId)) or 0
+
+  if dailyBudget and dailySpent + dailyReserved + maxCpc > dailyBudget then
+    redis.call('SADD', KEYS[5], campaignId)
+  else
+    redis.call('SREM', KEYS[5], campaignId)
+  end
+  if totalBudget and totalSpent + totalReserved + maxCpc > totalBudget then
+    redis.call('SADD', KEYS[6], campaignId)
+  else
+    redis.call('SREM', KEYS[6], campaignId)
+  end
+
   reservation.status = 'RELEASED'
   reservation.updatedAt = tonumber(ARGV[3])
   local releasedRaw = cjson.encode(reservation)
   redis.call('SETEX', KEYS[1], tonumber(ARGV[2]), releasedRaw)
   redis.call('ZREM', KEYS[2], ARGV[1])
-  redis.call('SREM', KEYS[5], campaignId)
-  redis.call('SREM', KEYS[6], campaignId)
   return {1, releasedRaw}
 `;
