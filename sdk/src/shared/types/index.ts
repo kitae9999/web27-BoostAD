@@ -63,7 +63,6 @@ export interface DecisionResponse {
 export interface ViewLogRequest {
   blogKey: string;
   auctionId: string;
-  campaignId: string;
   postUrl: string;
   isHighIntent: boolean;
   behaviorScore: number;

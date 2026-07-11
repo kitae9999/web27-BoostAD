@@ -19,8 +19,8 @@ export class CreateViewLogDto {
   blogKey: string;
 
   @IsString()
-  @IsNotEmpty()
-  campaignId: string;
+  @IsOptional()
+  campaignId?: string;
 
   @IsUrl({ require_tld: false })
   @IsNotEmpty()

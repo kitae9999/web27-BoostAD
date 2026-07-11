@@ -15,10 +15,13 @@ import { CampaignRepository } from 'src/campaign/repository/campaign.repository.
 import { BlogRepository } from 'src/blog/repository/blog.repository.interface';
 import { UserRepository } from 'src/user/repository/user.repository.interface';
 import { UserRole } from 'src/user/entities/user.entity';
+import { ConfigService } from '@nestjs/config';
 
 @Injectable()
 export class SdkService {
   private readonly logger = new Logger(SdkService.name);
+  private readonly reservationLifecycleEnabled: boolean;
+  private readonly reservationResultTtlSeconds: number;
 
   constructor(
     private readonly logRepository: LogRepository,
@@ -26,10 +29,23 @@ export class SdkService {
     private readonly campaignCacheRepository: CampaignCacheRepository,
     private readonly campaignRepository: CampaignRepository,
     private readonly blogRepository: BlogRepository,
-    private readonly userRepository: UserRepository
-  ) {}
+    private readonly userRepository: UserRepository,
+    private readonly configService: ConfigService
+  ) {
+    this.reservationLifecycleEnabled =
+      this.configService.get<string>('RTB_BUDGET_MODE') ===
+      'reservation_lifecycle';
+    this.reservationResultTtlSeconds = this.getPositiveIntConfig(
+      'RTB_AUCTION_RESULT_TTL_SECONDS',
+      30 * 60
+    );
+  }
 
   async recordView(dto: CreateViewLogDto, visitorId: string) {
+    if (this.reservationLifecycleEnabled) {
+      return this.recordReservationView(dto);
+    }
+
     const {
       auctionId,
       campaignId,
@@ -38,6 +54,10 @@ export class SdkService {
       behaviorScore,
       positionRatio,
     } = dto;
+
+    if (!campaignId) {
+      throw new BadRequestException('campaignId가 필요합니다.');
+    }
 
     const auctionData = await this.cacheRepository.getAuctionData(auctionId);
     if (!auctionData) {
@@ -130,8 +150,55 @@ export class SdkService {
     return viewId;
   }
 
+  private async recordReservationView(dto: CreateViewLogDto): Promise<number> {
+    const reservation =
+      await this.campaignCacheRepository.getAuctionReservation(dto.auctionId);
+    if (!reservation || reservation.status === 'RELEASED') {
+      throw new NotFoundException('유효한 auction reservation이 없습니다.');
+    }
+    if (dto.campaignId && dto.campaignId !== reservation.campaignId) {
+      throw new BadRequestException(
+        'campaignId가 auction winner와 일치하지 않습니다.'
+      );
+    }
+
+    const dedupResult =
+      await this.cacheRepository.acquireAuctionViewIdempotencyKey(
+        dto.auctionId
+      );
+    if (dedupResult.status === 'exists') return dedupResult.viewId;
+    if (dedupResult.status === 'locked') {
+      const existingViewId =
+        await this.cacheRepository.getAuctionViewIdByIdempotencyKey(
+          dto.auctionId
+        );
+      if (existingViewId !== null) return existingViewId;
+      throw new ConflictException('동일 auction의 View를 처리 중입니다.');
+    }
+
+    const viewId = await this.logRepository.saveViewLog({
+      auctionId: dto.auctionId,
+      campaignId: reservation.campaignId,
+      blogId: reservation.blogId,
+      postUrl: dto.postUrl,
+      cost: reservation.reservedAmount,
+      positionRatio: dto.positionRatio ?? null,
+      isHighIntent: dto.isHighIntent,
+      behaviorScore: dto.behaviorScore,
+    });
+    await this.cacheRepository.setAuctionViewIdempotencyKey(
+      dto.auctionId,
+      viewId
+    );
+    return viewId;
+  }
+
   async recordClick(dto: CreateClickLogDto): Promise<number | null> {
     const { viewId } = dto;
+
+    if (this.reservationLifecycleEnabled) {
+      return this.recordReservationClick(viewId);
+    }
 
     const exists = await this.logRepository.existsByViewId(viewId);
     if (!exists) {
@@ -171,11 +238,43 @@ export class SdkService {
       return null;
     }
 
-    const clickId = await this.logRepository.saveClickLog({ viewId });
-
     // 클릭 시 Rollback 정보 + 백업 삭제 (Dismiss Beacon이 와도 무시되도록)
     await this.cacheRepository.deleteRollbackInfo(viewId);
     await this.cacheRepository.deleteRollbackBackup(viewId);
+
+    return this.persistClickAndRevenue(viewId);
+  }
+
+  private async recordReservationClick(viewId: number): Promise<number | null> {
+    const viewLog = await this.logRepository.getViewLog(viewId);
+    if (!viewLog) {
+      throw new BadRequestException('잘못된 요청입니다.');
+    }
+    const transition = await this.campaignCacheRepository.commitAuction(
+      viewLog.auctionId,
+      this.getKstBudgetDate(Date.now()),
+      this.reservationResultTtlSeconds
+    );
+    if (
+      transition.outcome !== 'committed' &&
+      transition.outcome !== 'already_committed'
+    ) {
+      this.logger.warn(
+        `[SDK ClickLog] 확정할 수 없는 auction: auctionId=${viewLog.auctionId}, outcome=${transition.outcome}`
+      );
+      return null;
+    }
+
+    const isDup = await this.cacheRepository.setClickIdempotencyKey(
+      viewId,
+      this.reservationResultTtlSeconds * 1000
+    );
+    if (isDup) return null;
+    return this.persistClickAndRevenue(viewId);
+  }
+
+  private async persistClickAndRevenue(viewId: number): Promise<number> {
+    const clickId = await this.logRepository.saveClickLog({ viewId });
 
     // DB dailySpent 동기화: ClickLog 저장과 함께 DB에도 spent 증가
     const viewLog = await this.logRepository.getViewLog(viewId);
@@ -187,7 +286,7 @@ export class SdkService {
     }
 
     this.logger.log(
-      `[SDK ClickLog] 클릭 기록 완료: viewId=${viewId}, clickId=${clickId} (Rollback 삭제 + DB 동기화)`
+      `[SDK ClickLog] 클릭 기록 완료: viewId=${viewId}, clickId=${clickId} (예산 확정 + DB 동기화)`
     );
 
     // 퍼블리셔 수익 지급 (cost의 80%, PUBLISHER만)
@@ -235,6 +334,19 @@ export class SdkService {
 
     this.logger.debug(`[SDK Dismiss] 시작: viewId=${viewId}`);
 
+    if (this.reservationLifecycleEnabled) {
+      const viewLog = await this.logRepository.getViewLog(viewId);
+      if (!viewLog) return;
+      const transition = await this.campaignCacheRepository.releaseAuction(
+        viewLog.auctionId,
+        this.reservationResultTtlSeconds
+      );
+      this.logger.debug(
+        `[SDK Dismiss] auction release: auctionId=${viewLog.auctionId}, outcome=${transition.outcome}`
+      );
+      return;
+    }
+
     // 1. Redis에서 Rollback 정보 조회
     const rollbackInfo = await this.cacheRepository.getRollbackInfo(viewId);
     if (!rollbackInfo) {
@@ -262,5 +374,16 @@ export class SdkService {
     this.logger.log(
       `[SDK Dismiss] 롤백 완료: viewId=${viewId}, campaign=${campaignId}, cost=-${cost} (일일/총), elapsed=${Math.floor(elapsedMs / 1000)}s`
     );
+  }
+
+  private getKstBudgetDate(nowMs: number): string {
+    const kst = new Date(nowMs + 9 * 60 * 60 * 1000);
+    return `${kst.getUTCFullYear()}-${String(kst.getUTCMonth() + 1).padStart(2, '0')}-${String(kst.getUTCDate()).padStart(2, '0')}`;
+  }
+
+  private getPositiveIntConfig(name: string, defaultValue: number): number {
+    const raw = this.configService.get<string>(name);
+    const parsed = raw ? Number.parseInt(raw, 10) : defaultValue;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
   }
 }
