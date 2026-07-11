@@ -528,10 +528,10 @@ export class TransformerMatcher extends Matcher {
     }
 
     const thresholdPassedHits = documentHits.filter(
-      (hit) => hit.similarity >= this.documentSimilarityThreshold
+      (hit) => hit.similarity >= this.documentSimilarityThreshold  // 임계값 필터
     );
     const retainedHits = this.budgetEligibilityHint
-      .filterEligibleBy(thresholdPassedHits, (hit) => hit.campaignId)
+      .filterEligibleBy(thresholdPassedHits, (hit) => hit.campaignId) // Exhausted 제거 필터
       .slice(0, this.annTopM);
     this.metricsService.observeRtbAnnRetrievedCampaignCount(
       retainedHits.length
