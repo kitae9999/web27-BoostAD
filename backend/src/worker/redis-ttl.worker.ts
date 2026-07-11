@@ -11,7 +11,6 @@ import { IOREDIS_CLIENT } from 'src/redis/redis.constant';
 import type { AppIORedisClient } from 'src/redis/redis.type';
 import { CacheRepository } from '../cache/repository/cache.repository.interface';
 import { CampaignCacheRepository } from 'src/campaign/repository/campaign.cache.repository.interface';
-import { MetricsService } from 'src/metrics/metrics.service';
 
 // TTL 만료 이벤트를 감지하여 롤백을 수행하는 Worker
 @Injectable()
@@ -29,7 +28,6 @@ export class RedisTTLWorker implements OnModuleInit, OnModuleDestroy {
     @Inject(IOREDIS_CLIENT) private readonly ioRedisClient: AppIORedisClient,
     private readonly cacheRepository: CacheRepository,
     private readonly campaignCacheRepository: CampaignCacheRepository,
-    private readonly metricsService: MetricsService,
     private readonly configService: ConfigService
   ) {
     this.reservationLifecycleEnabled =
@@ -119,13 +117,6 @@ export class RedisTTLWorker implements OnModuleInit, OnModuleDestroy {
         (result) =>
           result.status === 'fulfilled' && result.value.outcome === 'released'
       ).length;
-      results.forEach((result) => {
-        this.metricsService.recordRtbAuctionTransition(
-          'timeout_release',
-          result.status === 'fulfilled' ? result.value.outcome : 'error'
-        );
-      });
-
       if (failed > 0) {
         this.logger.error(
           `[Reservation Sweep] 일부 회수 실패: scanned=${auctionIds.length}, released=${released}, failed=${failed}`
