@@ -48,6 +48,9 @@ export class LoadtestService {
     'backup:rollback:view:*',
     'dedup:view:*',
     'dedup:click:*',
+    'rtb:reservation:*',
+    'rtb:budget:daily-reserved:*',
+    'rtb:budget:total-reserved',
     'rtb:budget:daily-exhausted-campaigns',
     'rtb:budget:total-exhausted-campaigns',
   ];
