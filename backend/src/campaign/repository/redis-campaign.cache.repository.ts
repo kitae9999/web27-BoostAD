@@ -3,7 +3,10 @@ import { ConfigService } from '@nestjs/config';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { IOREDIS_CLIENT } from 'src/redis/redis.constant';
 import type { AppIORedisClient } from 'src/redis/redis.type';
-import { CampaignCacheRepository } from './campaign.cache.repository.interface';
+import {
+  CampaignCacheRepository,
+  type CampaignCacheWriteOptions,
+} from './campaign.cache.repository.interface';
 import {
   BudgetReservationCandidate,
   BudgetReservationResult,
@@ -44,6 +47,7 @@ import {
   CAMPAIGN_CACHE_REMOVED_EVENT,
   CAMPAIGN_CACHE_UPSERTED_EVENT,
 } from '../events/campaign-cache.events';
+import { CampaignServingEventStore } from '../events/campaign-serving-event.store';
 import {
   resolveEmbeddingProfile,
   toEmbeddingNamespace,
@@ -86,7 +90,8 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   constructor(
     @Inject(IOREDIS_CLIENT) private readonly ioredisClient: AppIORedisClient,
     private readonly configService: ConfigService,
-    private readonly eventEmitter: EventEmitter2
+    private readonly eventEmitter: EventEmitter2,
+    private readonly servingEventStore: CampaignServingEventStore
   ) {
     this.embeddingProfile = resolveEmbeddingProfile(
       this.configService.get<string>('RTB_EMBEDDING_PROFILE')
@@ -118,7 +123,8 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   async saveCampaignCacheById(
     id: string,
     data: CachedCampaign,
-    ttl = this.CAMPAIGN_CACHE_TTL
+    ttl = this.CAMPAIGN_CACHE_TTL,
+    options: CampaignCacheWriteOptions = {}
   ): Promise<void> {
     const key = this.getCampaignCacheKey(id);
 
@@ -130,7 +136,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       ]);
       await this.syncCampaignTagVectorDocs(data);
       await this.syncCampaignDocumentVectorDoc(data);
-      this.publishUpsert(data);
+      await this.publishUpsert(data, options.durableEvent !== false);
     } catch (error) {
       this.logger.error(`캐시 저장 실패: ${id}`, error);
       throw error;
@@ -221,7 +227,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       if (updatedCampaign) {
         await this.syncCampaignTagVectorDocs(updatedCampaign);
         await this.syncCampaignDocumentVectorDoc(updatedCampaign);
-        this.publishUpsert(updatedCampaign);
+        await this.publishUpsert(updatedCampaign);
       }
     } catch (error) {
       this.logger.error(`캐시 저장 실패: ${id}`, error);
@@ -244,7 +250,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       if (updatedCampaign) {
         await this.syncCampaignTagVectorDocs(updatedCampaign);
         await this.syncCampaignDocumentVectorDoc(updatedCampaign);
-        this.publishUpsert(updatedCampaign);
+        await this.publishUpsert(updatedCampaign);
       }
     } catch (error) {
       this.logger.error(`캠페인 상태 업데이트 실패: ${id}`, error);
@@ -280,7 +286,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       ]);
       const updatedCampaign = await this.findCampaignCacheById(id);
       if (updatedCampaign) {
-        this.publishUpsert(updatedCampaign);
+        await this.publishUpsert(updatedCampaign);
       }
     } catch (error) {
       this.logger.error(`임베딩 삭제 실패: ${id}`, error);
@@ -651,6 +657,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       this.deleteCampaignDocumentVectorDoc(id),
     ]);
     this.allCampaignsCache = null;
+    await this.servingEventStore.publishDelete(id);
     this.eventEmitter.emit(CAMPAIGN_CACHE_REMOVED_EVENT, { campaignId: id });
     this.logger.debug(`캐시 삭제: ${id}`);
   }
@@ -685,7 +692,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       const campaign = await this.findCampaignCacheById(id);
       if (campaign) {
         await this.syncCampaignTagVectorDocs(campaign);
-        this.publishUpsert(campaign);
+        await this.publishUpsert(campaign);
       }
     } catch (error) {
       this.logger.error(`캠페인 임베딩 업데이트 실패: ${id}`, error);
@@ -736,7 +743,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
           this.syncCampaignTagVectorDocs(campaign),
           this.syncCampaignDocumentVectorDoc(campaign),
         ]);
-        this.publishUpsert(campaign);
+        await this.publishUpsert(campaign);
       }
     } catch (error) {
       this.logger.error(`캠페인 semantic 임베딩 업데이트 실패: ${id}`, error);
@@ -832,8 +839,14 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
     }
   }
 
-  private publishUpsert(campaign: CachedCampaign): void {
+  private async publishUpsert(
+    campaign: CachedCampaign,
+    durableEvent = true
+  ): Promise<void> {
     this.allCampaignsCache = null;
+    if (durableEvent) {
+      await this.servingEventStore.publishUpsert(campaign);
+    }
     this.eventEmitter.emit(CAMPAIGN_CACHE_UPSERTED_EVENT, { campaign });
   }
 

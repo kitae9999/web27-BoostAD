@@ -14,11 +14,16 @@ import {
   ReserveAuctionResult,
 } from '../types/campaign.types';
 
+export type CampaignCacheWriteOptions = {
+  durableEvent?: boolean;
+};
+
 export abstract class CampaignCacheRepository {
   abstract saveCampaignCacheById(
     id: string,
     data: CachedCampaign,
-    ttl?: number
+    ttl?: number,
+    options?: CampaignCacheWriteOptions
   ): Promise<void>;
 
   abstract updateCampaignWithoutCachedById(

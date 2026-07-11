@@ -90,7 +90,9 @@ describe('CampaignService initial cache loading', () => {
       campaign.id,
       expect.objectContaining({
         embeddingTags: { typescript: embedding },
-      })
+      }),
+      undefined,
+      { durableEvent: false }
     );
     expect(embeddingQueue.getJob).not.toHaveBeenCalled();
     expect(embeddingQueue.add).not.toHaveBeenCalled();
@@ -156,7 +158,9 @@ describe('CampaignService initial cache loading', () => {
 
     expect(campaignCacheRepository.saveCampaignCacheById).toHaveBeenCalledWith(
       campaign.id,
-      expect.not.objectContaining({ embeddingTags: expect.anything() })
+      expect.not.objectContaining({ embeddingTags: expect.anything() }),
+      undefined,
+      { durableEvent: false }
     );
     expect(embeddingQueue.add).toHaveBeenCalledWith(
       'generate-campaign-embedding',

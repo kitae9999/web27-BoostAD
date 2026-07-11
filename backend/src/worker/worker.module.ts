@@ -15,6 +15,7 @@ import { RedisTTLWorker } from './redis-ttl.worker';
 import { getTypeOrmConfig } from 'src/config/typeorm.config';
 import { ContextEmbeddingService } from 'src/rtb/context/context-embedding.service';
 import { MetricsModule } from 'src/metrics/metrics.module';
+import { CampaignServingEventStore } from 'src/campaign/events/campaign-serving-event.store';
 
 @Module({
   imports: [
@@ -33,6 +34,7 @@ import { MetricsModule } from 'src/metrics/metrics.module';
     EmbeddingWorker,
     ContextEmbeddingService,
     RedisTTLWorker,
+    CampaignServingEventStore,
     { provide: MLEngine, useClass: XenovaMLEngine },
     {
       provide: CampaignCacheRepository,

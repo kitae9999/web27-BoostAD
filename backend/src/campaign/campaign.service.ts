@@ -98,7 +98,9 @@ export class CampaignService {
         // Redis에 캐싱
         await this.campaignCacheRepository.saveCampaignCacheById(
           campaign.id,
-          campaignCache
+          campaignCache,
+          undefined,
+          { durableEvent: false }
         );
 
         loaded++;

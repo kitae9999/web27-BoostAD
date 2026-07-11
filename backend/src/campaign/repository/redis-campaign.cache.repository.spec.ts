@@ -4,6 +4,11 @@ import type { AppIORedisClient } from 'src/redis/redis.type';
 import { RedisCampaignCacheRepository } from './redis-campaign.cache.repository';
 
 describe('RedisCampaignCacheRepository winner-only reservation', () => {
+  const eventStore = {
+    publishUpsert: jest.fn().mockResolvedValue(null),
+    publishDelete: jest.fn().mockResolvedValue(null),
+  };
+
   const buildRepository = (evalResult: [number, number]) => {
     const redis = {
       eval: jest.fn().mockResolvedValue(evalResult),
@@ -16,7 +21,8 @@ describe('RedisCampaignCacheRepository winner-only reservation', () => {
       repository: new RedisCampaignCacheRepository(
         redis,
         config,
-        new EventEmitter2()
+        new EventEmitter2(),
+        eventStore as never
       ),
       redis,
     };
@@ -62,7 +68,8 @@ describe('RedisCampaignCacheRepository winner-only reservation', () => {
     const repository = new RedisCampaignCacheRepository(
       redis,
       config,
-      new EventEmitter2()
+      new EventEmitter2(),
+      eventStore as never
     );
 
     await expect(repository.getBudgetExhaustedCampaignIds()).resolves.toEqual(
@@ -88,7 +95,8 @@ describe('RedisCampaignCacheRepository winner-only reservation', () => {
     const repository = new RedisCampaignCacheRepository(
       redis,
       config,
-      new EventEmitter2()
+      new EventEmitter2(),
+      eventStore as never
     );
 
     await repository.clearBudgetExhaustion('campaign-1');
@@ -127,7 +135,8 @@ describe('RedisCampaignCacheRepository winner-only reservation', () => {
     const repository = new RedisCampaignCacheRepository(
       redis,
       config,
-      new EventEmitter2()
+      new EventEmitter2(),
+      eventStore as never
     );
 
     await expect(
@@ -206,7 +215,8 @@ describe('RedisCampaignCacheRepository winner-only reservation', () => {
     const repository = new RedisCampaignCacheRepository(
       redis,
       config,
-      new EventEmitter2()
+      new EventEmitter2(),
+      eventStore as never
     );
 
     await expect(repository.releaseAuction('orphan', 1800)).resolves.toEqual({
@@ -248,7 +258,8 @@ describe('RedisCampaignCacheRepository winner-only reservation', () => {
     const repository = new RedisCampaignCacheRepository(
       redis,
       config,
-      new EventEmitter2()
+      new EventEmitter2(),
+      eventStore as never
     );
 
     await expect(
@@ -329,7 +340,8 @@ describe('RedisCampaignCacheRepository winner-only reservation', () => {
     const repository = new RedisCampaignCacheRepository(
       redis,
       config,
-      new EventEmitter2()
+      new EventEmitter2(),
+      eventStore as never
     );
 
     await expect(
