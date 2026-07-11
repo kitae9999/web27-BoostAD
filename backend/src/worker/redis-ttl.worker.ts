@@ -5,6 +5,7 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import Redis from 'ioredis';
 import { IOREDIS_CLIENT } from 'src/redis/redis.constant';
 import type { AppIORedisClient } from 'src/redis/redis.type';
@@ -16,14 +17,41 @@ import { CampaignCacheRepository } from 'src/campaign/repository/campaign.cache.
 export class RedisTTLWorker implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(RedisTTLWorker.name);
   private subscriber: Redis | null = null;
+  private reservationSweepTimer: ReturnType<typeof setInterval> | null = null;
+  private reservationSweepRunning = false;
+  private readonly reservationLifecycleEnabled: boolean;
+  private readonly reservationSweepIntervalMs: number;
+  private readonly reservationSweepBatchSize: number;
+  private readonly reservationResultTtlSeconds: number;
 
   constructor(
     @Inject(IOREDIS_CLIENT) private readonly ioRedisClient: AppIORedisClient,
     private readonly cacheRepository: CacheRepository,
-    private readonly campaignCacheRepository: CampaignCacheRepository
-  ) {}
+    private readonly campaignCacheRepository: CampaignCacheRepository,
+    private readonly configService: ConfigService
+  ) {
+    this.reservationLifecycleEnabled =
+      this.configService.get<string>('RTB_BUDGET_MODE') ===
+      'reservation_lifecycle';
+    this.reservationSweepIntervalMs = this.getPositiveIntConfig(
+      'RTB_RESERVATION_SWEEP_INTERVAL_MS',
+      1000
+    );
+    this.reservationSweepBatchSize = this.getPositiveIntConfig(
+      'RTB_RESERVATION_SWEEP_BATCH_SIZE',
+      100
+    );
+    this.reservationResultTtlSeconds = this.getPositiveIntConfig(
+      'RTB_AUCTION_RESULT_TTL_SECONDS',
+      30 * 60
+    );
+  }
 
   async onModuleInit() {
+    if (this.reservationLifecycleEnabled) {
+      this.startReservationSweep();
+    }
+
     try {
       // Keyspace Notification 활성화
       await this.ioRedisClient.config('SET', 'notify-keyspace-events', 'Ex');
@@ -48,12 +76,73 @@ export class RedisTTLWorker implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy() {
+    if (this.reservationSweepTimer) {
+      clearInterval(this.reservationSweepTimer);
+      this.reservationSweepTimer = null;
+      this.logger.log('Auction reservation 만료 회수 종료');
+    }
+
     if (this.subscriber) {
       await this.subscriber.unsubscribe('__keyevent@0__:expired');
       this.subscriber.disconnect();
       this.logger.log('TTL Worker 종료 - Keyspace Notification 구독 해제');
       // TODO: 이 부분이 무작정 해제되도 Redis >= DB의 단방향 불일치는 유지되는가?
     }
+  }
+
+  async sweepExpiredReservations(): Promise<void> {
+    if (this.reservationSweepRunning) return;
+    this.reservationSweepRunning = true;
+
+    try {
+      const auctionIds =
+        await this.campaignCacheRepository.findExpiredAuctionIds(
+          Date.now(),
+          this.reservationSweepBatchSize
+        );
+      if (auctionIds.length === 0) return;
+
+      const results = await Promise.allSettled(
+        auctionIds.map((auctionId) =>
+          this.campaignCacheRepository.releaseAuction(
+            auctionId,
+            this.reservationResultTtlSeconds
+          )
+        )
+      );
+      const failed = results.filter(
+        (result) => result.status === 'rejected'
+      ).length;
+      const released = results.filter(
+        (result) =>
+          result.status === 'fulfilled' && result.value.outcome === 'released'
+      ).length;
+
+      if (failed > 0) {
+        this.logger.error(
+          `[Reservation Sweep] 일부 회수 실패: scanned=${auctionIds.length}, released=${released}, failed=${failed}`
+        );
+      } else {
+        this.logger.debug(
+          `[Reservation Sweep] 만료 예약 회수: scanned=${auctionIds.length}, released=${released}`
+        );
+      }
+    } catch (error) {
+      this.logger.error('[Reservation Sweep] 만료 예약 조회 실패', error);
+    } finally {
+      this.reservationSweepRunning = false;
+    }
+  }
+
+  private startReservationSweep(): void {
+    this.reservationSweepTimer = setInterval(() => {
+      void this.sweepExpiredReservations();
+    }, this.reservationSweepIntervalMs);
+    this.reservationSweepTimer.unref?.();
+    void this.sweepExpiredReservations();
+    this.logger.log(
+      `Auction reservation 만료 회수 시작: interval=${this.reservationSweepIntervalMs}ms, batch=${this.reservationSweepBatchSize}`
+    );
   }
 
   // TTL 만료된 키 처리
@@ -89,5 +178,11 @@ export class RedisTTLWorker implements OnModuleInit, OnModuleDestroy {
     } catch (error) {
       this.logger.error(`[TTL Worker] 롤백 실패: viewId=${viewId}`, error);
     }
+  }
+
+  private getPositiveIntConfig(name: string, defaultValue: number): number {
+    const raw = this.configService.get<string>(name);
+    const parsed = raw ? Number.parseInt(raw, 10) : defaultValue;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
   }
 }
