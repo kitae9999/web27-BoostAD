@@ -37,15 +37,19 @@ export class BudgetEligibilityHintService implements OnModuleInit {
   }
 
   filterEligible<T extends CampaignIdentity>(campaigns: T[]): T[] {
-    if (!this.enabled || campaigns.length === 0) {
-      return campaigns;
+    return this.filterEligibleBy(campaigns, (campaign) => campaign.id);
+  }
+
+  filterEligibleBy<T>(items: T[], selectId: (item: T) => string): T[] {
+    if (!this.enabled || items.length === 0) {
+      return items;
     }
 
     this.scheduleRefreshIfStale();
-    const eligible = campaigns.filter(
-      (campaign) => !this.exhaustedIds.has(campaign.id)
+    const eligible = items.filter(
+      (item) => !this.exhaustedIds.has(selectId(item))
     );
-    const excludedCount = campaigns.length - eligible.length;
+    const excludedCount = items.length - eligible.length;
     if (excludedCount > 0) {
       this.metricsService.incRtbBudgetHintExcluded(excludedCount);
     }

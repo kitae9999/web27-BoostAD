@@ -446,7 +446,11 @@ export class TransformerMatcher extends Matcher {
     }
 
     const groupHitsStartedAt = process.hrtime.bigint();
-    const retrievedCampaignIds = this.aggregateAnnTagHits(tagHits)
+    const budgetEligibleTagHits = this.budgetEligibilityHint.filterEligibleBy(
+      tagHits,
+      (hit) => hit.campaignId
+    );
+    const retrievedCampaignIds = this.aggregateAnnTagHits(budgetEligibleTagHits)
       .slice(0, this.annTopM)
       .map((item) => item.campaignId);
     this.metricsService.recordRtbStage(
@@ -523,8 +527,11 @@ export class TransformerMatcher extends Matcher {
       );
     }
 
-    const retainedHits = documentHits
-      .filter((hit) => hit.similarity >= this.documentSimilarityThreshold)
+    const thresholdPassedHits = documentHits.filter(
+      (hit) => hit.similarity >= this.documentSimilarityThreshold
+    );
+    const retainedHits = this.budgetEligibilityHint
+      .filterEligibleBy(thresholdPassedHits, (hit) => hit.campaignId)
       .slice(0, this.annTopM);
     this.metricsService.observeRtbAnnRetrievedCampaignCount(
       retainedHits.length
@@ -602,8 +609,11 @@ export class TransformerMatcher extends Matcher {
         isHighIntent: context.isHighIntent,
         nowTs: Date.now(),
       });
-    const retainedHits = documentHits
-      .filter((hit) => hit.similarity >= this.documentSimilarityThreshold)
+    const thresholdPassedHits = documentHits.filter(
+      (hit) => hit.similarity >= this.documentSimilarityThreshold
+    );
+    const retainedHits = this.budgetEligibilityHint
+      .filterEligibleBy(thresholdPassedHits, (hit) => hit.campaignId)
       .slice(0, this.annTopM);
     const ids = retainedHits.map((hit) => hit.campaignId);
     const retrievedCampaigns = this.localSnapshotEnabled
@@ -698,7 +708,10 @@ export class TransformerMatcher extends Matcher {
     const sparseSupplements = fused
       .filter((item) => !item.dense && item.sparse)
       .slice(0, this.hybridSparseSupplementLimit);
-    const rerankPool = [...denseCandidates, ...sparseSupplements];
+    const rerankPool = this.budgetEligibilityHint.filterEligibleBy(
+      [...denseCandidates, ...sparseSupplements],
+      (item) => item.campaignId
+    );
     const rerankStartedAt = process.hrtime.bigint();
     const rerankIds = rerankPool.map((item) => item.campaignId);
     const hydratedPool = this.localSnapshotEnabled
@@ -977,9 +990,12 @@ export class TransformerMatcher extends Matcher {
     isHighIntent: boolean,
     requireEmbeddings = true
   ): MatchableCampaign[] {
+    // 가장 값싼 local Set lookup을 먼저 수행해 Date 파싱, embedding 검사,
+    // exact rerank로 소진 캠페인이 넘어가지 않게 한다.
+    const budgetEligible = this.budgetEligibilityHint.filterEligible(campaigns);
     const now = new Date();
 
-    const servingEligible = campaigns.filter((campaign) => {
+    return budgetEligible.filter((campaign) => {
       // 삭제된 캠페인 제외
       if (campaign.deletedAt) {
         return false;
@@ -1014,8 +1030,6 @@ export class TransformerMatcher extends Matcher {
 
       return true;
     });
-
-    return this.budgetEligibilityHint.filterEligible(servingEligible);
   }
 
   private normalizeText(text: string): string {

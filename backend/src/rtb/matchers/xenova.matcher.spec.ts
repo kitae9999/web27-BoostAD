@@ -128,6 +128,7 @@ describe('TransformerMatcher ANN path', () => {
     } as unknown as ContextEmbeddingService,
     budgetEligibilityHint = {
       filterEligible: jest.fn((campaigns) => campaigns),
+      filterEligibleBy: jest.fn((items) => items),
     } as unknown as BudgetEligibilityHintService
   ) =>
     new TransformerMatcher(
@@ -256,6 +257,59 @@ describe('TransformerMatcher ANN path', () => {
     expect(candidates.map((candidate) => candidate.id)).toEqual(
       expect.arrayContaining(['c1', 'c2'])
     );
+  });
+
+  it('removes exhausted ANN IDs before Top-M slicing and hydration', async () => {
+    const campaigns = [
+      buildCampaign('c1', ['first'], { first: [1, 0] }),
+      buildCampaign('c2', ['second'], { second: [0.9, 0.1] }),
+      buildCampaign('c3', ['third'], { third: [0.8, 0.2] }),
+    ];
+    const repository = buildRepository(campaigns);
+    repository.searchCampaignTagVectors.mockResolvedValue([
+      { campaignId: 'c1', tagName: 'first', distance: 0.01, similarity: 0.99 },
+      {
+        campaignId: 'c2',
+        tagName: 'second',
+        distance: 0.02,
+        similarity: 0.98,
+      },
+      { campaignId: 'c3', tagName: 'third', distance: 0.03, similarity: 0.97 },
+    ]);
+    const budgetEligibilityHint = {
+      filterEligible: jest.fn((items) => items),
+      filterEligibleBy: jest.fn(
+        <T>(items: T[], selectId: (item: T) => string) =>
+          items.filter((item) => selectId(item) !== 'c1')
+      ),
+    } as unknown as BudgetEligibilityHintService;
+    const matcher = buildMatcher(
+      repository,
+      buildSnapshot(campaigns),
+      buildMlEngine(),
+      buildMetricsService(),
+      buildConfigService({
+        RTB_MATCHER_ANN_ENABLED: 'true',
+        RTB_MATCHER_ANN_TOP_M: '2',
+      }),
+      undefined,
+      budgetEligibilityHint
+    );
+
+    await matcher.findCandidatesByTags({
+      blogKey: 'blog',
+      blogId: 1,
+      blogName: 'blog',
+      tags: ['first', 'second', 'third'],
+      postUrl: 'https://example.com/post',
+      behaviorScore: 80,
+      isHighIntent: false,
+    });
+
+    expect(repository.findCampaignCachesByIds).toHaveBeenCalledWith([
+      'c2',
+      'c3',
+    ]);
   });
 
   it('falls back when ANN returns no hits', async () => {

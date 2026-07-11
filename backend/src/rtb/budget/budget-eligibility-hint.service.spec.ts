@@ -46,6 +46,21 @@ describe('BudgetEligibilityHintService', () => {
     expect(metrics.setRtbBudgetHintSnapshotSize).toHaveBeenCalledWith(1);
   });
 
+  it('filters ANN hits by campaign ID before campaign hydration', async () => {
+    const { service } = buildService();
+    await service.onModuleInit();
+
+    expect(
+      service.filterEligibleBy(
+        [
+          { campaignId: 'daily-exhausted', similarity: 0.9 },
+          { campaignId: 'available', similarity: 0.8 },
+        ],
+        (hit) => hit.campaignId
+      )
+    ).toEqual([{ campaignId: 'available', similarity: 0.8 }]);
+  });
+
   it('keeps the last successful snapshot when Redis refresh fails', async () => {
     const { service, repository, metrics } = buildService();
     await service.onModuleInit();
