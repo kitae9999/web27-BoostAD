@@ -31,7 +31,13 @@ export class CampaignServingEventConsumer
     configService: ConfigService,
     private readonly metricsService: MetricsService
   ) {
-    this.enabled = this.eventStore.isEnabled() && this.snapshot.isEnabled();
+    const projectionPipelineEnabled =
+      configService.get<string>('RTB_PROJECTION_PIPELINE_ENABLED', 'false') ===
+      'true';
+    this.enabled =
+      !projectionPipelineEnabled &&
+      this.eventStore.isEnabled() &&
+      this.snapshot.isEnabled();
     this.readCount = this.getPositiveInt(
       configService,
       'RTB_CAMPAIGN_EVENT_READ_COUNT',

@@ -18,6 +18,7 @@ import {
   type CampaignServingEvent,
   type CampaignServingEventCheckpoint,
 } from './events/campaign-serving-event';
+import { CampaignServingProjectionRepository } from './projection/campaign-serving-projection.repository';
 
 export type ServingCampaign = Omit<
   CachedCampaign,
@@ -69,12 +70,14 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
   >();
   private readonly enabled: boolean;
   private readonly eventSyncEnabled: boolean;
+  private readonly projectionBootstrapEnabled: boolean;
   private readonly embeddingProfile: EmbeddingProfile;
   private readonly requireDocumentEmbedding: boolean;
 
   constructor(
     private readonly campaignCacheRepository: CampaignCacheRepository,
-    configService: ConfigService
+    configService: ConfigService,
+    private readonly projectionRepository: CampaignServingProjectionRepository
   ) {
     this.embeddingProfile = resolveEmbeddingProfile(
       configService.get<string>('RTB_EMBEDDING_PROFILE')
@@ -94,6 +97,11 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
     this.eventSyncEnabled =
       configService.get<string>('RTB_CAMPAIGN_EVENT_SYNC_ENABLED', 'false') ===
       'true';
+    this.projectionBootstrapEnabled =
+      configService.get<string>('RTB_PROJECTION_PIPELINE_ENABLED', 'false') ===
+        'true' ||
+      configService.get<string>('RTB_CAMPAIGN_BOOTSTRAP_SOURCE') ===
+        'db_projection';
   }
 
   async onApplicationBootstrap(): Promise<void> {
@@ -245,7 +253,7 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
       ...this.state,
       version: this.state.version + 1,
       builtAtMs: Date.now(),
-      ready: true,
+      ready: this.state.ready,
       sequence: event.sequence,
       lastEventId: event.eventId,
       lastEventAtMs: event.occurredAtMs,
@@ -269,9 +277,17 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
     checkpoint: CampaignServingEventCheckpoint
   ): Promise<void> {
     this.markNotReady();
-    const campaigns = await this.campaignCacheRepository.getAllCampaigns({
-      allowStale: false,
-    });
+    const source = this.projectionBootstrapEnabled
+      ? await this.projectionRepository.loadSnapshot()
+      : {
+          campaigns: await this.campaignCacheRepository.getAllCampaigns({
+            allowStale: false,
+          }),
+          checkpoint,
+          campaignVersions: new Map<string, number>(),
+          complete: true,
+        };
+    const campaigns = source.campaigns;
     const campaignsById = new Map(
       campaigns.map((campaign) => {
         const servingCampaign = this.toServingCampaign(campaign);
@@ -288,18 +304,18 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
     this.state = {
       version: this.state.version + 1,
       builtAtMs: Date.now(),
-      ready: true,
-      sequence: checkpoint.sequence,
-      lastEventId: checkpoint.eventId,
+      ready: source.complete,
+      sequence: source.checkpoint.sequence,
+      lastEventId: source.checkpoint.eventId,
       lastEventAtMs: this.state.lastEventAtMs,
       campaignsById,
       campaignIdsByTag: this.buildTagIndex(campaignsById),
-      campaignVersions: new Map(),
+      campaignVersions: source.campaignVersions,
     };
     this.initialized = true;
     this.mutationsDuringInitialization.clear();
     this.logger.log(
-      `RTB 캠페인 스냅샷 재구축 완료: ${campaignsById.size}개, sequence=${checkpoint.sequence}`
+      `RTB 캠페인 스냅샷 재구축 완료: ${campaignsById.size}개, sequence=${source.checkpoint.sequence}`
     );
   }
 
@@ -332,9 +348,20 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
   }
 
   private async buildInitialSnapshot(): Promise<void> {
-    const campaigns = await this.campaignCacheRepository.getAllCampaigns({
-      allowStale: false,
-    });
+    const source = this.projectionBootstrapEnabled
+      ? await this.projectionRepository.loadSnapshot()
+      : {
+          campaigns: await this.campaignCacheRepository.getAllCampaigns({
+            allowStale: false,
+          }),
+          checkpoint: {
+            eventId: this.state.lastEventId,
+            sequence: this.state.sequence,
+          },
+          campaignVersions: this.state.campaignVersions,
+          complete: true,
+        };
+    const campaigns = source.campaigns;
     const campaignsById = new Map(
       campaigns.map((campaign) => {
         const servingCampaign = this.toServingCampaign(campaign);
@@ -353,13 +380,13 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
     this.state = {
       version: this.state.version + 1,
       builtAtMs: Date.now(),
-      ready: true,
-      sequence: this.state.sequence,
-      lastEventId: this.state.lastEventId,
+      ready: source.complete,
+      sequence: source.checkpoint.sequence,
+      lastEventId: source.checkpoint.eventId,
       lastEventAtMs: this.state.lastEventAtMs,
       campaignsById,
       campaignIdsByTag: this.buildTagIndex(campaignsById),
-      campaignVersions: this.state.campaignVersions,
+      campaignVersions: source.campaignVersions,
     };
     this.initialized = true;
     this.mutationsDuringInitialization.clear();

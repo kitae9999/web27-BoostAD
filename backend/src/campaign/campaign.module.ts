@@ -23,6 +23,13 @@ import { CampaignServingEventStore } from './events/campaign-serving-event.store
 import { CampaignServingEventConsumer } from './campaign-serving-event.consumer';
 import { CampaignServingStatusController } from './campaign-serving-status.controller';
 import { MetricsModule } from '../metrics/metrics.module';
+import { CampaignServingProjectionRepository } from './projection/campaign-serving-projection.repository';
+import { CampaignProjectionRequestEntity } from './projection/entities/campaign-projection-request.entity';
+import { CampaignServingProjectionEntity } from './projection/entities/campaign-serving-projection.entity';
+import { CampaignServingOutboxEntity } from './projection/entities/campaign-serving-outbox.entity';
+import { CampaignServingKafkaConsumer } from './projection/campaign-serving-kafka.consumer';
+import { CampaignProjectionSchemaService } from './projection/campaign-projection-schema.service';
+import { CampaignProjectionObservabilityService } from './projection/campaign-projection-observability.service';
 
 @Module({
   imports: [
@@ -31,6 +38,9 @@ import { MetricsModule } from '../metrics/metrics.module';
       TagEntity,
       UserEntity,
       CreditHistoryEntity,
+      CampaignProjectionRequestEntity,
+      CampaignServingProjectionEntity,
+      CampaignServingOutboxEntity,
     ]),
     LogModule,
     ImageModule,
@@ -42,11 +52,15 @@ import { MetricsModule } from '../metrics/metrics.module';
   ],
   controllers: [CampaignController, CampaignServingStatusController],
   providers: [
+    CampaignProjectionSchemaService,
+    CampaignProjectionObservabilityService,
     CampaignService,
     CampaignCronService,
     CampaignServingSnapshotService,
     CampaignServingEventStore,
     CampaignServingEventConsumer,
+    CampaignServingProjectionRepository,
+    CampaignServingKafkaConsumer,
     { provide: CampaignRepository, useClass: TypeOrmCampaignRepository },
     {
       provide: CampaignCacheRepository,

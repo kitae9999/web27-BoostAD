@@ -1,7 +1,14 @@
-import { Column, Entity, PrimaryColumn, UpdateDateColumn } from 'typeorm';
+import {
+  Column,
+  Entity,
+  Index,
+  PrimaryColumn,
+  UpdateDateColumn,
+} from 'typeorm';
 import type { CachedCampaign } from '../../types/campaign.types';
 
 @Entity('CampaignServingProjection')
+@Index('idx_campaign_serving_projection_version', ['version'])
 export class CampaignServingProjectionEntity {
   @PrimaryColumn({ name: 'campaign_id', type: 'varchar', length: 255 })
   campaignId: string;
@@ -26,6 +33,12 @@ export class CampaignServingProjectionEntity {
   @Column({ type: 'boolean', default: false })
   deleted: boolean;
 
-  @UpdateDateColumn({ name: 'updated_at', type: 'datetime', precision: 3 })
+  @UpdateDateColumn({
+    name: 'updated_at',
+    type: 'datetime',
+    precision: 3,
+    default: () => 'CURRENT_TIMESTAMP(3)',
+    onUpdate: 'CURRENT_TIMESTAMP(3)',
+  })
   updatedAt: Date;
 }

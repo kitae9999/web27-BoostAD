@@ -6,7 +6,7 @@ import { MetricsService } from 'src/metrics/metrics.service';
 import { Job } from 'bullmq';
 
 describe('EmbeddingWorker lifecycle', () => {
-  const buildWorker = (modelReady: boolean) => {
+  const buildWorker = (modelReady: boolean, projectionPipeline = false) => {
     const mlEngine = {
       isReady: jest.fn(() => modelReady),
       getModelVersion: jest.fn(() => 'model-v2'),
@@ -33,7 +33,14 @@ describe('EmbeddingWorker lifecycle', () => {
       mlEngine,
       repository,
       contextEmbeddingService,
-      metricsService
+      metricsService,
+      {
+        get: jest.fn((key: string, fallback: string) =>
+          key === 'RTB_PROJECTION_PIPELINE_ENABLED' && projectionPipeline
+            ? 'true'
+            : fallback
+        ),
+      } as never
     );
     const bullWorker = {
       isRunning: jest.fn(() => false),
@@ -168,5 +175,18 @@ describe('EmbeddingWorker lifecycle', () => {
         },
       }
     );
+  });
+
+  it('does not let the legacy campaign embedding job overwrite a DB projection', async () => {
+    const { worker, mlEngine, repository } = buildWorker(true, true);
+
+    await worker.process({
+      id: 'legacy-campaign-job',
+      name: 'generate-campaign-embedding',
+      data: { campaignId: 'c1', modelVersion: 'model-v2' },
+    } as unknown as Job);
+
+    expect(mlEngine.getEmbedding).not.toHaveBeenCalled();
+    expect(repository.updateCampaignEmbeddings).not.toHaveBeenCalled();
   });
 });

@@ -16,6 +16,13 @@ export enum CampaignServingPublishState {
 
 @Entity('CampaignServingOutbox')
 @Index('idx_campaign_serving_outbox_poll', ['state', 'availableAt', 'id'])
+@Index(
+  'uq_campaign_serving_outbox_version',
+  ['campaignId', 'campaignVersion'],
+  {
+    unique: true,
+  }
+)
 export class CampaignServingOutboxEntity {
   @PrimaryGeneratedColumn({ type: 'bigint', unsigned: true })
   id: string;
@@ -61,9 +68,22 @@ export class CampaignServingOutboxEntity {
   })
   publishedAt: Date | null;
 
+  @Column({
+    name: 'kafka_offset',
+    type: 'bigint',
+    unsigned: true,
+    nullable: true,
+  })
+  kafkaOffset: string | null;
+
   @Column({ name: 'last_error', type: 'text', nullable: true })
   lastError: string | null;
 
-  @CreateDateColumn({ name: 'created_at', type: 'datetime', precision: 3 })
+  @CreateDateColumn({
+    name: 'created_at',
+    type: 'datetime',
+    precision: 3,
+    default: () => 'CURRENT_TIMESTAMP(3)',
+  })
   createdAt: Date;
 }

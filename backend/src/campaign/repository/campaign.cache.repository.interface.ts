@@ -104,7 +104,10 @@ export abstract class CampaignCacheRepository {
     payload: CampaignEmbeddingPayload
   ): Promise<void>;
 
-  abstract deleteCampaignCacheById(id: string): Promise<void>;
+  abstract deleteCampaignCacheById(
+    id: string,
+    options?: CampaignCacheWriteOptions
+  ): Promise<void>;
   abstract existsCampaignCacheById(id: string): Promise<boolean>;
 
   // RTB 비딩용: 모든 캠페인 조회 (Redis에서)

@@ -33,6 +33,7 @@ describe('CampaignService initial cache loading', () => {
     config: {
       profile?: 'legacy_minilm' | 'multilingual_e5_small';
       denseMode?: 'legacy_tag' | 'semantic_document';
+      projectionPipeline?: boolean;
     } = {}
   ) => {
     const campaignRepository = {
@@ -65,6 +66,9 @@ describe('CampaignService initial cache loading', () => {
           if (key === 'RTB_DENSE_RETRIEVAL_MODE') {
             return config.denseMode ?? 'legacy_tag';
           }
+          if (key === 'RTB_PROJECTION_PIPELINE_ENABLED') {
+            return config.projectionPipeline ? 'true' : 'false';
+          }
           return undefined;
         }),
       } as never,
@@ -72,12 +76,30 @@ describe('CampaignService initial cache loading', () => {
     );
 
     return {
-      service: service as unknown as { loadAllCampaigns(): Promise<void> },
+      service: service as unknown as {
+        loadAllCampaigns(): Promise<void>;
+        onModelReady(): void;
+      },
       campaignCacheRepository,
       embeddingQueue,
       campaignServingSnapshot,
     };
   };
+
+  it('leaves initial campaign projection to the DB outbox worker when enabled', () => {
+    const { service, campaignCacheRepository, embeddingQueue } = buildService(
+      null,
+      undefined,
+      { projectionPipeline: true }
+    );
+
+    service.onModelReady();
+
+    expect(
+      campaignCacheRepository.findCampaignCacheById
+    ).not.toHaveBeenCalled();
+    expect(embeddingQueue.add).not.toHaveBeenCalled();
+  });
 
   it('preserves complete cached embeddings and does not enqueue regeneration', async () => {
     const cached = {

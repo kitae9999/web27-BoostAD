@@ -154,6 +154,36 @@ export class MetricsService {
       registers: [this.registry],
     });
 
+  private readonly campaignProjectionRequestBacklog = new Gauge({
+    name: 'boostad_campaign_projection_request_backlog',
+    help: 'PENDING/PROCESSING/FAILED campaign projection request 수',
+    registers: [this.registry],
+  });
+
+  private readonly campaignProjectionRequestFailed = new Gauge({
+    name: 'boostad_campaign_projection_request_failed',
+    help: '현재 FAILED campaign projection request 수',
+    registers: [this.registry],
+  });
+
+  private readonly campaignServingOutboxBacklog = new Gauge({
+    name: 'boostad_campaign_serving_outbox_backlog',
+    help: '아직 Kafka ACK를 받지 못한 serving outbox 수',
+    registers: [this.registry],
+  });
+
+  private readonly campaignServingOutboxFailed = new Gauge({
+    name: 'boostad_campaign_serving_outbox_failed',
+    help: '현재 FAILED serving outbox 수',
+    registers: [this.registry],
+  });
+
+  private readonly campaignProjectionOldestPendingAgeSeconds = new Gauge({
+    name: 'boostad_campaign_projection_oldest_pending_age_seconds',
+    help: '가장 오래된 미완료 projection/outbox 작업의 대기 시간',
+    registers: [this.registry],
+  });
+
   private readonly rtbEligibleCampaignCount = new Histogram({
     name: 'boostad_rtb_eligible_campaign_count',
     help: 'RTB eligible 캠페인 수 분포',
@@ -649,6 +679,22 @@ export class MetricsService {
 
   recordCampaignSnapshotRecovery(reason: string) {
     this.campaignSnapshotRecoveryTotal.inc({ reason });
+  }
+
+  setCampaignProjectionPipelineState(state: {
+    projectionBacklog: number;
+    projectionFailed: number;
+    servingOutboxBacklog: number;
+    servingOutboxFailed: number;
+    oldestPendingAgeSeconds: number;
+  }): void {
+    this.campaignProjectionRequestBacklog.set(state.projectionBacklog);
+    this.campaignProjectionRequestFailed.set(state.projectionFailed);
+    this.campaignServingOutboxBacklog.set(state.servingOutboxBacklog);
+    this.campaignServingOutboxFailed.set(state.servingOutboxFailed);
+    this.campaignProjectionOldestPendingAgeSeconds.set(
+      state.oldestPendingAgeSeconds
+    );
   }
 
   observeRtbPayload(direction: 'request' | 'response', bytes: number) {

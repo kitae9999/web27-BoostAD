@@ -25,6 +25,13 @@ describe('MetricsService', () => {
       lastEventAtMs: Date.now(),
     });
     service.recordCampaignSnapshotRecovery('gap');
+    service.setCampaignProjectionPipelineState({
+      projectionBacklog: 3,
+      projectionFailed: 1,
+      servingOutboxBacklog: 2,
+      servingOutboxFailed: 0,
+      oldestPendingAgeSeconds: 4.5,
+    });
 
     const metrics = await service.getMetrics();
 
@@ -54,6 +61,12 @@ describe('MetricsService', () => {
     expect(metrics).toContain('boostad_campaign_snapshot_size 1000');
     expect(metrics).toContain(
       'boostad_campaign_snapshot_recovery_total{reason="gap"} 1'
+    );
+    expect(metrics).toContain('boostad_campaign_projection_request_backlog 3');
+    expect(metrics).toContain('boostad_campaign_projection_request_failed 1');
+    expect(metrics).toContain('boostad_campaign_serving_outbox_backlog 2');
+    expect(metrics).toContain(
+      'boostad_campaign_projection_oldest_pending_age_seconds 4.5'
     );
   });
 });

@@ -651,7 +651,10 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
     }
   }
 
-  async deleteCampaignCacheById(id: string): Promise<void> {
+  async deleteCampaignCacheById(
+    id: string,
+    options: CampaignCacheWriteOptions = {}
+  ): Promise<void> {
     const key = this.getCampaignCacheKey(id);
     await Promise.all([
       this.ioredisClient.del(key),
@@ -661,11 +664,16 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       this.deleteCampaignDocumentVectorDoc(id),
     ]);
     this.allCampaignsCache = null;
-    const servingEvent = await this.servingEventStore.publishDelete(id);
-    this.eventEmitter.emit(CAMPAIGN_CACHE_REMOVED_EVENT, {
-      campaignId: id,
-      ...(servingEvent ? { servingEvent } : {}),
-    });
+    const servingEvent =
+      options.durableEvent !== false
+        ? await this.servingEventStore.publishDelete(id)
+        : null;
+    if (options.localEvent !== false) {
+      this.eventEmitter.emit(CAMPAIGN_CACHE_REMOVED_EVENT, {
+        campaignId: id,
+        ...(servingEvent ? { servingEvent } : {}),
+      });
+    }
     this.logger.debug(`캐시 삭제: ${id}`);
   }
 

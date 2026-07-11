@@ -41,12 +41,14 @@ import {
 } from 'src/rtb/ml/embedding-profile';
 import { EMBEDDING_QUEUE_NAME } from 'src/queue/queue.names';
 import { CampaignServingSnapshotService } from './campaign-serving-snapshot.service';
+import { randomUUID } from 'node:crypto';
 
 @Injectable()
 export class CampaignService {
   private readonly logger = new Logger(CampaignService.name);
   private readonly embeddingProfile: EmbeddingProfile;
   private readonly requireDocumentEmbedding: boolean;
+  private readonly projectionPipelineEnabled: boolean;
 
   constructor(
     private readonly campaignRepository: CampaignRepository,
@@ -67,10 +69,19 @@ export class CampaignService {
         'RTB_DENSE_RETRIEVAL_MODE',
         'semantic_document'
       ) === 'semantic_document';
+    this.projectionPipelineEnabled =
+      configService.get<string>('RTB_PROJECTION_PIPELINE_ENABLED', 'false') ===
+      'true';
   }
 
   @OnEvent('ml.model.ready')
   onModelReady(): void {
+    if (this.projectionPipelineEnabled) {
+      this.logger.log(
+        'Campaign 초기 projection은 DB Outbox worker가 담당합니다.'
+      );
+      return;
+    }
     this.logger.log('🚀 Campaign 초기 로딩 시작 (ML 모델 준비 완료)');
 
     // 백그라운드 실행 (await 없음)
@@ -247,13 +258,37 @@ export class CampaignService {
 
     // 트랜잭션으로 캠페인 생성과 크레딧 차감을 원자적으로? 처리
     return await this.dataSource.transaction(async (manager) => {
-      // TODO: Datasource가 아닌 InjectRepository로 받은 인스턴스로 쿼리를 날리고있어 트랜잭션에 안묶이므로 수정필요
-      const campaign = await this.campaignRepository.create(
-        userId,
-        dto,
-        tagIds,
-        initialStatus
+      const tagRepo = manager.getRepository(TagEntity);
+      const tags = await tagRepo.findByIds(tagIds);
+      const campaignRepo = manager.getRepository(CampaignEntity);
+      const savedCampaign = await campaignRepo.save(
+        campaignRepo.create({
+          id: randomUUID(),
+          userId,
+          title: dto.title,
+          content: dto.content,
+          image: dto.image,
+          url: dto.url,
+          maxCpc: dto.maxCpc,
+          dailyBudget: dto.dailyBudget,
+          totalBudget: dto.totalBudget,
+          dailySpent: 0,
+          totalSpent: 0,
+          lastResetDate: new Date(),
+          isHighIntent: dto.isHighIntent,
+          status: initialStatus,
+          startDate: new Date(dto.startDate),
+          endDate: new Date(dto.endDate),
+          tags,
+        })
       );
+      const campaign: CampaignWithTags = {
+        ...savedCampaign,
+        tags: savedCampaign.tags.map((tag) => ({
+          id: tag.id,
+          name: tag.name,
+        })),
+      };
 
       // 2. totalBudget이 있는 경우 크레딧 차감
       if (dto.totalBudget !== null) {
@@ -289,17 +324,17 @@ export class CampaignService {
         });
       }
 
-      // Redis 캐싱 (write-through 비슷하게)
-      await this.campaignCacheRepository.saveCampaignCacheById(
-        campaign.id,
-        this.convertToCachedCampaignType(campaign)
-      );
-
-      await this.embeddingQueue.add('generate-campaign-embedding', {
-        campaignId: campaign.id,
-        modelVersion: this.embeddingProfile.modelVersion,
-      });
-      this.logger.log(`캠페인 ${campaign.id} 임베딩 재생성 큐 추가`);
+      if (!this.projectionPipelineEnabled) {
+        await this.campaignCacheRepository.saveCampaignCacheById(
+          campaign.id,
+          this.convertToCachedCampaignType(campaign)
+        );
+        await this.embeddingQueue.add('generate-campaign-embedding', {
+          campaignId: campaign.id,
+          modelVersion: this.embeddingProfile.modelVersion,
+        });
+        this.logger.log(`캠페인 ${campaign.id} 임베딩 재생성 큐 추가`);
+      }
 
       return campaign;
     });
@@ -357,8 +392,7 @@ export class CampaignService {
     dto: UpdateCampaignDto
   ): Promise<CampaignWithTags> {
     // const campaign = await this.campaignRepository.findOne(campaignId, userId); A/B campaign
-    const cachedCampaign =
-      await this.campaignCacheRepository.findCampaignCacheById(campaignId);
+    const cachedCampaign = await this.findCampaignCommandState(campaignId);
 
     if (!cachedCampaign) {
       // A/B campaign
@@ -560,7 +594,10 @@ export class CampaignService {
         !this.areTagsEqual(dto.tags, cachedCampaign.tags)
       );
       const semanticTextChanged = Boolean(dto.title || dto.content);
-      if (tagsChanged || semanticTextChanged) {
+      if (
+        !this.projectionPipelineEnabled &&
+        (tagsChanged || semanticTextChanged)
+      ) {
         await this.campaignCacheRepository.deleteCampaignEmbeddingById(
           campaignId
         );
@@ -572,10 +609,12 @@ export class CampaignService {
       }
 
       // 3. Redis 전체 동기화 (DB 결과 반영, 요청한 상태로 복원)
-      await this.campaignCacheRepository.updateCampaignWithoutCachedById(
-        updatedCampaign.id,
-        this.convertToCachedCampaignTypeWithoutSpent(updatedCampaign)
-      );
+      if (!this.projectionPipelineEnabled) {
+        await this.campaignCacheRepository.updateCampaignWithoutCachedById(
+          updatedCampaign.id,
+          this.convertToCachedCampaignTypeWithoutSpent(updatedCampaign)
+        );
+      }
       if (
         dto.maxCpc !== undefined ||
         dto.dailyBudget !== undefined ||
@@ -618,8 +657,7 @@ export class CampaignService {
     offset: number = 0
   ) {
     // 소유권 검증
-    const cachedCampaign =
-      await this.campaignCacheRepository.findCampaignCacheById(campaignId);
+    const cachedCampaign = await this.findCampaignCommandState(campaignId);
 
     if (!cachedCampaign) {
       throw new NotFoundException('캠페인을 찾을 수 없습니다.');
@@ -647,8 +685,7 @@ export class CampaignService {
   // 캠페인 삭제 (소프트 삭제, 소유권 검증)
   async deleteCampaign(campaignId: string, userId: number): Promise<void> {
     // const campaign = await this.campaignRepository.findOne(campaignId, userId); A/B campaign
-    const cachedCampaign =
-      await this.campaignCacheRepository.findCampaignCacheById(campaignId);
+    const cachedCampaign = await this.findCampaignCommandState(campaignId);
 
     if (!cachedCampaign) {
       // A/B campaign
@@ -664,12 +701,16 @@ export class CampaignService {
     }
 
     // Redis 먼저 삭제 (RTB 비딩 중단)
-    await this.campaignCacheRepository.deleteCampaignCacheById(campaignId);
+    if (!this.projectionPipelineEnabled) {
+      await this.campaignCacheRepository.deleteCampaignCacheById(campaignId);
+    }
 
     // 트랜잭션으로 DB 삭제 + 예산 환불 처리
     await this.dataSource.transaction(async (manager) => {
       // DB 삭제 (Soft Delete)
-      await this.campaignRepository.delete(campaignId);
+      await manager
+        .getRepository(CampaignEntity)
+        .update({ id: campaignId }, { deletedAt: new Date() });
 
       // 남은 예산 환불 처리 (totalBudget이 설정된 경우만)
       if (
@@ -932,8 +973,22 @@ export class CampaignService {
     campaignId: string,
     status: CampaignStatus
   ) {
+    if (this.projectionPipelineEnabled) {
+      return;
+    }
     await this.campaignCacheRepository.updateCampaignStatus(campaignId, status);
     this.logger.log(`캠페인 ${campaignId} Redis 상태 → ${status}`);
+  }
+
+  private async findCampaignCommandState(
+    campaignId: string
+  ): Promise<CachedCampaign | null> {
+    if (!this.projectionPipelineEnabled) {
+      return this.campaignCacheRepository.findCampaignCacheById(campaignId);
+    }
+    const campaign = await this.campaignRepository.getById(campaignId);
+    if (!campaign || campaign.deletedAt) return null;
+    return this.convertToCachedCampaignType(campaign);
   }
 
   private areTagsEqual(dtoTags: string[], redisTags: string[]): boolean {

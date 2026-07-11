@@ -81,6 +81,126 @@ describe('CampaignServingSnapshotService', () => {
     expect(repository.findCampaignCachesByIds).not.toHaveBeenCalled();
   });
 
+  it('bootstraps from the versioned DB projection when the projection pipeline is enabled', async () => {
+    const campaign = buildCampaign('projection-c1');
+    const repository = buildRepository([]);
+    const projectionRepository = {
+      loadSnapshot: jest.fn().mockResolvedValue({
+        campaigns: [campaign],
+        checkpoint: { eventId: 'db:21', sequence: 21 },
+        campaignVersions: new Map([['projection-c1', 20]]),
+        complete: true,
+      }),
+    };
+    const service = new CampaignServingSnapshotService(
+      repository,
+      {
+        get: jest.fn((key: string, defaultValue?: string) => {
+          if (key === 'RTB_CAMPAIGN_SOURCE') return 'local_snapshot';
+          if (key === 'RTB_PROJECTION_PIPELINE_ENABLED') return 'true';
+          if (key === 'RTB_EMBEDDING_PROFILE') return 'legacy_minilm';
+          if (key === 'RTB_DENSE_RETRIEVAL_MODE') return 'legacy_tag';
+          return defaultValue;
+        }),
+      } as unknown as ConfigService,
+      projectionRepository as never
+    );
+
+    await expect(
+      service.findCampaignsByIds(['projection-c1'])
+    ).resolves.toHaveLength(1);
+    expect(service.getMetadata()).toEqual(
+      expect.objectContaining({
+        ready: true,
+        sequence: 21,
+        lastEventId: 'db:21',
+      })
+    );
+    expect(repository.getAllCampaigns).not.toHaveBeenCalled();
+  });
+
+  it('does not open readiness from partial projection events during initial backfill', async () => {
+    const campaign = buildCampaign('partial-c1');
+    const repository = buildRepository([]);
+    const service = new CampaignServingSnapshotService(
+      repository,
+      {
+        get: jest.fn((key: string, defaultValue?: string) => {
+          if (key === 'RTB_CAMPAIGN_SOURCE') return 'local_snapshot';
+          if (key === 'RTB_PROJECTION_PIPELINE_ENABLED') return 'true';
+          if (key === 'RTB_EMBEDDING_PROFILE') return 'legacy_minilm';
+          if (key === 'RTB_DENSE_RETRIEVAL_MODE') return 'legacy_tag';
+          return defaultValue;
+        }),
+      } as unknown as ConfigService,
+      {
+        loadSnapshot: jest.fn().mockResolvedValue({
+          campaigns: [],
+          checkpoint: { eventId: 'kafka:0:-1', sequence: 0 },
+          campaignVersions: new Map(),
+          complete: false,
+        }),
+      } as never
+    );
+    await service.findCampaignsByIds(['missing']);
+
+    service.applyServingEvent({
+      schemaVersion: 1,
+      eventId: 'kafka:0:0',
+      type: 'UPSERT',
+      campaignId: campaign.id,
+      campaignVersion: 1,
+      sequence: 1,
+      occurredAtMs: Date.now(),
+      campaign,
+    });
+
+    expect(service.getMetadata()).toMatchObject({ ready: false, size: 1 });
+  });
+
+  it('does not let a late Kafka event overwrite a newer bootstrapped campaign version', async () => {
+    const latest = { ...buildCampaign('c1'), title: 'latest' };
+    const older = { ...buildCampaign('c1'), title: 'older' };
+    const repository = buildRepository([]);
+    const service = new CampaignServingSnapshotService(
+      repository,
+      {
+        get: jest.fn((key: string, defaultValue?: string) => {
+          if (key === 'RTB_CAMPAIGN_SOURCE') return 'local_snapshot';
+          if (key === 'RTB_PROJECTION_PIPELINE_ENABLED') return 'true';
+          if (key === 'RTB_EMBEDDING_PROFILE') return 'legacy_minilm';
+          if (key === 'RTB_DENSE_RETRIEVAL_MODE') return 'legacy_tag';
+          return defaultValue;
+        }),
+      } as unknown as ConfigService,
+      {
+        loadSnapshot: jest.fn().mockResolvedValue({
+          campaigns: [latest],
+          checkpoint: { eventId: 'kafka:0:20', sequence: 21 },
+          campaignVersions: new Map([['c1', 30]]),
+          complete: true,
+        }),
+      } as never
+    );
+    await service.findCampaignsByIds(['c1']);
+
+    expect(
+      service.applyServingEvent({
+        schemaVersion: 1,
+        eventId: 'kafka:0:21',
+        type: 'UPSERT',
+        campaignId: 'c1',
+        campaignVersion: 29,
+        sequence: 22,
+        occurredAtMs: Date.now(),
+        campaign: older,
+      })
+    ).toBe('stale');
+    await expect(service.findCampaignsByIds(['c1'])).resolves.toEqual([
+      expect.objectContaining({ title: 'latest' }),
+    ]);
+  });
+
   it('rebuilds a bulk-loaded snapshot once while preserving its stream checkpoint', async () => {
     const first = buildCampaign('c1');
     const second = buildCampaign('c2');

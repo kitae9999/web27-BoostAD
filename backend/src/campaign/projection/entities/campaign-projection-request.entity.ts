@@ -21,6 +21,7 @@ export enum CampaignOutboxState {
 
 @Entity('CampaignProjectionRequestOutbox')
 @Index('idx_campaign_projection_request_poll', ['state', 'availableAt', 'id'])
+@Index('idx_campaign_projection_request_campaign', ['campaignId', 'id'])
 export class CampaignProjectionRequestEntity {
   @PrimaryGeneratedColumn({ type: 'bigint', unsigned: true })
   id: string;
@@ -55,9 +56,20 @@ export class CampaignProjectionRequestEntity {
   @Column({ name: 'last_error', type: 'text', nullable: true })
   lastError: string | null;
 
-  @CreateDateColumn({ name: 'created_at', type: 'datetime', precision: 3 })
+  @CreateDateColumn({
+    name: 'created_at',
+    type: 'datetime',
+    precision: 3,
+    default: () => 'CURRENT_TIMESTAMP(3)',
+  })
   createdAt: Date;
 
-  @UpdateDateColumn({ name: 'updated_at', type: 'datetime', precision: 3 })
+  @UpdateDateColumn({
+    name: 'updated_at',
+    type: 'datetime',
+    precision: 3,
+    default: () => 'CURRENT_TIMESTAMP(3)',
+    onUpdate: 'CURRENT_TIMESTAMP(3)',
+  })
   updatedAt: Date;
 }

@@ -9,6 +9,7 @@ import type { ContextEmbeddingJobData } from 'src/queue/types/queue.type';
 import { MetricsService } from 'src/metrics/metrics.service';
 import { buildCampaignDocumentText } from 'src/rtb/ml/embedding-text';
 import { EMBEDDING_QUEUE_NAME } from 'src/queue/queue.names';
+import { ConfigService } from '@nestjs/config';
 
 @Processor(EMBEDDING_QUEUE_NAME, { autorun: false })
 export class EmbeddingWorker
@@ -17,14 +18,19 @@ export class EmbeddingWorker
 {
   private readonly logger = new Logger(EmbeddingWorker.name);
   private startRequested = false;
+  private readonly projectionPipelineEnabled: boolean;
 
   constructor(
     private readonly mlEngine: MLEngine,
     private readonly campaignCacheRepository: CampaignCacheRepository,
     private readonly contextEmbeddingService: ContextEmbeddingService,
-    private readonly metricsService: MetricsService
+    private readonly metricsService: MetricsService,
+    configService: ConfigService
   ) {
     super();
+    this.projectionPipelineEnabled =
+      configService.get<string>('RTB_PROJECTION_PIPELINE_ENABLED', 'false') ===
+      'true';
   }
 
   onApplicationBootstrap(): void {
@@ -55,6 +61,12 @@ export class EmbeddingWorker
 
     try {
       if (job.name === 'generate-campaign-embedding') {
+        if (this.projectionPipelineEnabled) {
+          this.logger.debug(
+            `Campaign embedding job ${job.id} 스킵: projection worker가 담당`
+          );
+          return;
+        }
         const { campaignId, modelVersion } = job.data as {
           campaignId: string;
           modelVersion?: string;

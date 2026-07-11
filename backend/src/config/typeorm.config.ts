@@ -13,7 +13,7 @@ export const getTypeOrmConfig = (
   entities: [__dirname + '/../**/*.entity{.ts,.js}'],
   migrations: [__dirname + '/../migrations/*{.ts,.js}'],
   migrationsRun:
-    configService.get<string>('DB_MIGRATIONS_RUN', 'true') === 'true',
+    configService.get<string>('DB_MIGRATIONS_RUN', 'false') === 'true',
   autoLoadEntities: false,
   synchronize: configService.get<string>('NODE_ENV') !== 'production', // 개발 시에만 자동 동기화
   logging:

@@ -46,6 +46,7 @@ export class CreateCampaignProjectionPipeline1783789200000 implements MigrationI
         available_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
         locked_at DATETIME(3) NULL,
         published_at DATETIME(3) NULL,
+        kafka_offset BIGINT UNSIGNED NULL,
         last_error TEXT NULL,
         created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
         PRIMARY KEY (id),
@@ -59,6 +60,15 @@ export class CreateCampaignProjectionPipeline1783789200000 implements MigrationI
     await queryRunner.query(`
       INSERT INTO CampaignProjectionRequestOutbox (campaign_id, operation)
       SELECT id, IF(deleted_at IS NULL, 'UPSERT', 'DELETE') FROM Campaign
+      WHERE NOT EXISTS (
+        SELECT 1 FROM CampaignServingProjection projection
+        WHERE projection.campaign_id = Campaign.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM CampaignProjectionRequestOutbox request
+        WHERE request.campaign_id = Campaign.id
+          AND request.state IN ('PENDING', 'PROCESSING', 'FAILED')
+      )
     `);
   }
 

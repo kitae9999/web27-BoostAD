@@ -42,8 +42,10 @@ export class CampaignServingEventStore {
     configService: ConfigService
   ) {
     this.enabled =
+      configService.get<string>('RTB_PROJECTION_PIPELINE_ENABLED', 'false') !==
+        'true' &&
       configService.get<string>('RTB_CAMPAIGN_EVENT_SYNC_ENABLED', 'false') ===
-      'true';
+        'true';
     this.streamKey = configService.get<string>(
       'RTB_CAMPAIGN_EVENT_STREAM_KEY',
       'rtb:campaign-serving:events'
