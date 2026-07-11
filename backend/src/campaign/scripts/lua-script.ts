@@ -238,28 +238,44 @@ export const REDIS_RESERVE_AUCTION_SCRIPT = `
   local candidateCount = #KEYS - 6
   local redisTime = redis.call('TIME')
   local nowMs = tonumber(redisTime[1]) * 1000 + math.floor(tonumber(redisTime[2]) / 1000)
+  local function firstValue(document, path)
+    local values = document[path]
+    if not values or #values == 0 or values[1] == cjson.null then
+      return nil
+    end
+    return values[1]
+  end
+
   for i = 1, candidateCount do
     local campaignKey = KEYS[i + 6]
     local cpc = tonumber(ARGV[6 + i])
     local campaignId = ARGV[6 + candidateCount + i]
-    local statusRaw = redis.call('JSON.GET', campaignKey, '$.status')
-    local dailyBudgetRaw = redis.call('JSON.GET', campaignKey, '$.dailyBudget')
-    local totalBudgetRaw = redis.call('JSON.GET', campaignKey, '$.totalBudget')
-    local dailySpentRaw = redis.call('JSON.GET', campaignKey, '$.dailySpent')
-    local totalSpentRaw = redis.call('JSON.GET', campaignKey, '$.totalSpent')
-    local maxCpcRaw = redis.call('JSON.GET', campaignKey, '$.maxCpc')
+    local campaignRaw = redis.call(
+      'JSON.GET',
+      campaignKey,
+      '$.status',
+      '$.dailyBudget',
+      '$.totalBudget',
+      '$.dailySpent',
+      '$.totalSpent',
+      '$.maxCpc'
+    )
 
-    if statusRaw and string.find(statusRaw, 'ACTIVE', 1, true)
-      and dailyBudgetRaw and totalBudgetRaw and dailySpentRaw and totalSpentRaw and maxCpcRaw then
-      local dailyBudget = tonumber(string.match(dailyBudgetRaw, '%[([%d%.]+)%]'))
-      local totalBudget = tonumber(string.match(totalBudgetRaw, '%[([%d%.]+)%]'))
-      local dailySpent = tonumber(string.match(dailySpentRaw, '%[([%d%.]+)%]')) or 0
-      local totalSpent = tonumber(string.match(totalSpentRaw, '%[([%d%.]+)%]')) or 0
-      local maxCpc = tonumber(string.match(maxCpcRaw, '%[([%d%.]+)%]')) or cpc
+    if campaignRaw then
+      local campaign = cjson.decode(campaignRaw)
+      local status = firstValue(campaign, '$.status')
+      local dailyBudget = tonumber(firstValue(campaign, '$.dailyBudget'))
+      local totalBudget = tonumber(firstValue(campaign, '$.totalBudget'))
+      local dailySpent = tonumber(firstValue(campaign, '$.dailySpent')) or 0
+      local totalSpent = tonumber(firstValue(campaign, '$.totalSpent')) or 0
+      local maxCpc = tonumber(firstValue(campaign, '$.maxCpc')) or cpc
       local dailyReserved = tonumber(redis.call('HGET', KEYS[3], campaignId)) or 0
       local totalReserved = tonumber(redis.call('HGET', KEYS[4], campaignId)) or 0
-      local dailyEligible = dailyBudget and dailySpent + dailyReserved + cpc <= dailyBudget
-      local totalEligible = not totalBudget or totalSpent + totalReserved + cpc <= totalBudget
+      local dailyEligible = status == 'ACTIVE'
+        and dailyBudget
+        and dailySpent + dailyReserved + cpc <= dailyBudget
+      local totalEligible = status == 'ACTIVE'
+        and (not totalBudget or totalSpent + totalReserved + cpc <= totalBudget)
 
       if dailyEligible and totalEligible then
         local nextDailyReserved = redis.call('HINCRBYFLOAT', KEYS[3], campaignId, cpc)
@@ -293,10 +309,12 @@ export const REDIS_RESERVE_AUCTION_SCRIPT = `
         return {1, campaignId, i, reservationJson}
       end
 
-      if dailySpent + dailyReserved + maxCpc > dailyBudget then
+      if status == 'ACTIVE' and dailyBudget
+        and dailySpent + dailyReserved + maxCpc > dailyBudget then
         redis.call('SADD', KEYS[5], campaignId)
       end
-      if totalBudget and totalSpent + totalReserved + maxCpc > totalBudget then
+      if status == 'ACTIVE' and totalBudget
+        and totalSpent + totalReserved + maxCpc > totalBudget then
         redis.call('SADD', KEYS[6], campaignId)
       end
     end
