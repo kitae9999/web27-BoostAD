@@ -68,6 +68,7 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
     SnapshotMutation
   >();
   private readonly enabled: boolean;
+  private readonly eventSyncEnabled: boolean;
   private readonly embeddingProfile: EmbeddingProfile;
   private readonly requireDocumentEmbedding: boolean;
 
@@ -90,12 +91,19 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
           'RTB_MATCHER_LOCAL_SNAPSHOT_ENABLED',
           'false'
         ) === 'true';
+    this.eventSyncEnabled =
+      configService.get<string>('RTB_CAMPAIGN_EVENT_SYNC_ENABLED', 'false') ===
+      'true';
   }
 
   async onApplicationBootstrap(): Promise<void> {
-    if (this.enabled) {
+    if (this.enabled && !this.eventSyncEnabled) {
       await this.ensureInitialized();
     }
+  }
+
+  isEnabled(): boolean {
+    return this.enabled;
   }
 
   async findCampaignsByIds(ids: string[]): Promise<ServingCampaign[]> {
@@ -255,6 +263,54 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
       sequence: checkpoint.sequence,
       lastEventId: checkpoint.eventId,
     };
+  }
+
+  async reloadFromSource(
+    checkpoint: CampaignServingEventCheckpoint
+  ): Promise<void> {
+    this.markNotReady();
+    const campaigns = await this.campaignCacheRepository.getAllCampaigns({
+      allowStale: false,
+    });
+    const campaignsById = new Map(
+      campaigns.map((campaign) => {
+        const servingCampaign = this.toServingCampaign(campaign);
+        return [servingCampaign.id, servingCampaign] as const;
+      })
+    );
+    for (const [campaignId, mutation] of this.mutationsDuringInitialization) {
+      if (mutation) {
+        campaignsById.set(campaignId, mutation);
+      } else {
+        campaignsById.delete(campaignId);
+      }
+    }
+    this.state = {
+      version: this.state.version + 1,
+      builtAtMs: Date.now(),
+      ready: true,
+      sequence: checkpoint.sequence,
+      lastEventId: checkpoint.eventId,
+      lastEventAtMs: this.state.lastEventAtMs,
+      campaignsById,
+      campaignIdsByTag: this.buildTagIndex(campaignsById),
+      campaignVersions: new Map(),
+    };
+    this.initialized = true;
+    this.mutationsDuringInitialization.clear();
+    this.logger.log(
+      `RTB 캠페인 스냅샷 재구축 완료: ${campaignsById.size}개, sequence=${checkpoint.sequence}`
+    );
+  }
+
+  async refreshFromCurrentSource(): Promise<void> {
+    if (!this.enabled) {
+      return;
+    }
+    await this.reloadFromSource({
+      eventId: this.state.lastEventId,
+      sequence: this.state.sequence,
+    });
   }
 
   markNotReady(): void {

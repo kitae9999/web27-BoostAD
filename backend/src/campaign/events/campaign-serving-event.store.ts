@@ -100,12 +100,13 @@ export class CampaignServingEventStore {
 
   async readAfter(
     eventId: string,
-    options: { count: number; blockMs: number }
+    options: { count: number; blockMs: number },
+    reader: AppIORedisClient = this.redis
   ): Promise<CampaignServingEvent[]> {
     if (!this.enabled) {
       return [];
     }
-    const result = (await this.redis.xread(
+    const result = (await reader.xread(
       'COUNT',
       options.count,
       'BLOCK',

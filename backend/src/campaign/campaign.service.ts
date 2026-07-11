@@ -40,6 +40,7 @@ import {
   type EmbeddingProfile,
 } from 'src/rtb/ml/embedding-profile';
 import { EMBEDDING_QUEUE_NAME } from 'src/queue/queue.names';
+import { CampaignServingSnapshotService } from './campaign-serving-snapshot.service';
 
 @Injectable()
 export class CampaignService {
@@ -55,7 +56,8 @@ export class CampaignService {
     @InjectDataSource() private readonly dataSource: DataSource,
     @InjectQueue(EMBEDDING_QUEUE_NAME)
     private readonly embeddingQueue: Queue<EmbeddingJobData>,
-    configService: ConfigService
+    configService: ConfigService,
+    private readonly campaignServingSnapshot: CampaignServingSnapshotService
   ) {
     this.embeddingProfile = resolveEmbeddingProfile(
       configService.get<string>('RTB_EMBEDDING_PROFILE')
@@ -100,7 +102,7 @@ export class CampaignService {
           campaign.id,
           campaignCache,
           undefined,
-          { durableEvent: false }
+          { durableEvent: false, localEvent: false }
         );
 
         loaded++;
@@ -121,6 +123,8 @@ export class CampaignService {
           );
         }
       }
+
+      await this.campaignServingSnapshot.refreshFromCurrentSource();
 
       this.logger.log(
         `✅ Campaign 로딩 완료: ${loaded}개, 임베딩 큐: ${embeddingQueued}개`

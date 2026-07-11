@@ -81,6 +81,26 @@ describe('CampaignServingSnapshotService', () => {
     expect(repository.findCampaignCachesByIds).not.toHaveBeenCalled();
   });
 
+  it('rebuilds a bulk-loaded snapshot once while preserving its stream checkpoint', async () => {
+    const first = buildCampaign('c1');
+    const second = buildCampaign('c2');
+    const repository = buildRepository([first]);
+    const service = new CampaignServingSnapshotService(
+      repository,
+      configService
+    );
+    await service.findCampaignsByIds(['c1']);
+    service.setCheckpoint({ eventId: '12-0', sequence: 12 });
+    repository.getAllCampaigns.mockResolvedValue([first, second]);
+
+    await service.refreshFromCurrentSource();
+
+    expect(service.getMetadata()).toEqual(
+      expect.objectContaining({ ready: true, sequence: 12, size: 2 })
+    );
+    expect(repository.getAllCampaigns).toHaveBeenCalledTimes(2);
+  });
+
   it('requires the E5 document embedding in the default serving mode', async () => {
     const campaign = {
       ...buildCampaign('c1'),

@@ -18,6 +18,13 @@ describe('MetricsService', () => {
     const service = new MetricsService(queue as never);
     service.recordRtbAuctionTransition('reserve', 'reserved');
     service.recordRtbAuctionTransition('reserve', 'replayed');
+    service.setCampaignSnapshotState({
+      ready: true,
+      sequence: 12,
+      size: 1000,
+      lastEventAtMs: Date.now(),
+    });
+    service.recordCampaignSnapshotRecovery('gap');
 
     const metrics = await service.getMetrics();
 
@@ -41,6 +48,12 @@ describe('MetricsService', () => {
     );
     expect(metrics).toContain(
       'boostad_rtb_auction_transition_total{operation="reserve",outcome="reserved"} 1'
+    );
+    expect(metrics).toContain('boostad_campaign_snapshot_ready 1');
+    expect(metrics).toContain('boostad_campaign_snapshot_sequence 12');
+    expect(metrics).toContain('boostad_campaign_snapshot_size 1000');
+    expect(metrics).toContain(
+      'boostad_campaign_snapshot_recovery_total{reason="gap"} 1'
     );
   });
 });

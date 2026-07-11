@@ -20,6 +20,9 @@ import { RedisModule } from 'src/redis/redis.module';
 import { QueueModule } from 'src/queue/queue.module';
 import { CampaignServingSnapshotService } from './campaign-serving-snapshot.service';
 import { CampaignServingEventStore } from './events/campaign-serving-event.store';
+import { CampaignServingEventConsumer } from './campaign-serving-event.consumer';
+import { CampaignServingStatusController } from './campaign-serving-status.controller';
+import { MetricsModule } from '../metrics/metrics.module';
 
 @Module({
   imports: [
@@ -35,13 +38,15 @@ import { CampaignServingEventStore } from './events/campaign-serving-event.store
     // forwardRef(() => AdvertiserModule),
     RedisModule,
     QueueModule,
+    MetricsModule,
   ],
-  controllers: [CampaignController],
+  controllers: [CampaignController, CampaignServingStatusController],
   providers: [
     CampaignService,
     CampaignCronService,
     CampaignServingSnapshotService,
     CampaignServingEventStore,
+    CampaignServingEventConsumer,
     { provide: CampaignRepository, useClass: TypeOrmCampaignRepository },
     {
       provide: CampaignCacheRepository,

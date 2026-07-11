@@ -46,6 +46,9 @@ describe('CampaignService initial cache loading', () => {
       getJob: jest.fn().mockResolvedValue(job ?? null),
       add: jest.fn().mockResolvedValue(undefined),
     };
+    const campaignServingSnapshot = {
+      refreshFromCurrentSource: jest.fn().mockResolvedValue(undefined),
+    };
 
     const service = new CampaignService(
       campaignRepository as never,
@@ -64,13 +67,15 @@ describe('CampaignService initial cache loading', () => {
           }
           return undefined;
         }),
-      } as never
+      } as never,
+      campaignServingSnapshot as never
     );
 
     return {
       service: service as unknown as { loadAllCampaigns(): Promise<void> },
       campaignCacheRepository,
       embeddingQueue,
+      campaignServingSnapshot,
     };
   };
 
@@ -81,8 +86,12 @@ describe('CampaignService initial cache loading', () => {
       embeddingModelVersion:
         'Xenova/all-MiniLM-L6-v2@request-v1-mean-normalized',
     };
-    const { service, campaignCacheRepository, embeddingQueue } =
-      buildService(cached);
+    const {
+      service,
+      campaignCacheRepository,
+      embeddingQueue,
+      campaignServingSnapshot,
+    } = buildService(cached);
 
     await service.loadAllCampaigns();
 
@@ -92,10 +101,13 @@ describe('CampaignService initial cache loading', () => {
         embeddingTags: { typescript: embedding },
       }),
       undefined,
-      { durableEvent: false }
+      { durableEvent: false, localEvent: false }
     );
     expect(embeddingQueue.getJob).not.toHaveBeenCalled();
     expect(embeddingQueue.add).not.toHaveBeenCalled();
+    expect(
+      campaignServingSnapshot.refreshFromCurrentSource
+    ).toHaveBeenCalledTimes(1);
   });
 
   it('removes a stale failed job and enqueues missing embeddings again', async () => {
@@ -160,7 +172,7 @@ describe('CampaignService initial cache loading', () => {
       campaign.id,
       expect.not.objectContaining({ embeddingTags: expect.anything() }),
       undefined,
-      { durableEvent: false }
+      { durableEvent: false, localEvent: false }
     );
     expect(embeddingQueue.add).toHaveBeenCalledWith(
       'generate-campaign-embedding',

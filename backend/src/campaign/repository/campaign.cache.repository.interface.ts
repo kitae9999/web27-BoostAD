@@ -16,6 +16,7 @@ import {
 
 export type CampaignCacheWriteOptions = {
   durableEvent?: boolean;
+  localEvent?: boolean;
 };
 
 export abstract class CampaignCacheRepository {

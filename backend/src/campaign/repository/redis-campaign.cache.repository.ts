@@ -136,7 +136,11 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       ]);
       await this.syncCampaignTagVectorDocs(data);
       await this.syncCampaignDocumentVectorDoc(data);
-      await this.publishUpsert(data, options.durableEvent !== false);
+      await this.publishUpsert(
+        data,
+        options.durableEvent !== false,
+        options.localEvent !== false
+      );
     } catch (error) {
       this.logger.error(`캐시 저장 실패: ${id}`, error);
       throw error;
@@ -844,16 +848,19 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
 
   private async publishUpsert(
     campaign: CachedCampaign,
-    durableEvent = true
+    durableEvent = true,
+    localEvent = true
   ): Promise<void> {
     this.allCampaignsCache = null;
     const servingEvent = durableEvent
       ? await this.servingEventStore.publishUpsert(campaign)
       : null;
-    this.eventEmitter.emit(CAMPAIGN_CACHE_UPSERTED_EVENT, {
-      campaign,
-      ...(servingEvent ? { servingEvent } : {}),
-    });
+    if (localEvent) {
+      this.eventEmitter.emit(CAMPAIGN_CACHE_UPSERTED_EVENT, {
+        campaign,
+        ...(servingEvent ? { servingEvent } : {}),
+      });
+    }
   }
 
   /**

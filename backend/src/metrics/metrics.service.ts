@@ -27,6 +27,7 @@ type ContextObserveLabel = 'status';
 type ContextJobLabel = 'result';
 type ContextDecisionLabel = 'status';
 type ContextCacheLabel = 'result';
+type CampaignSnapshotRecoveryLabel = 'reason';
 
 @Injectable()
 export class MetricsService {
@@ -118,6 +119,38 @@ export class MetricsService {
       name: 'boostad_rtb_auction_transition_total',
       help: 'Auction reservation lifecycle transition count',
       labelNames: ['operation', 'outcome'],
+      registers: [this.registry],
+    });
+
+  private readonly campaignSnapshotReady = new Gauge({
+    name: 'boostad_campaign_snapshot_ready',
+    help: 'Campaign serving snapshot readiness (1=ready, 0=not ready)',
+    registers: [this.registry],
+  });
+
+  private readonly campaignSnapshotSequence = new Gauge({
+    name: 'boostad_campaign_snapshot_sequence',
+    help: '마지막으로 적용한 campaign serving event global sequence',
+    registers: [this.registry],
+  });
+
+  private readonly campaignSnapshotSize = new Gauge({
+    name: 'boostad_campaign_snapshot_size',
+    help: '현재 local campaign serving snapshot 문서 수',
+    registers: [this.registry],
+  });
+
+  private readonly campaignSnapshotLastEventAgeSeconds = new Gauge({
+    name: 'boostad_campaign_snapshot_last_event_age_seconds',
+    help: '마지막 campaign serving event 발생 후 경과 시간',
+    registers: [this.registry],
+  });
+
+  private readonly campaignSnapshotRecoveryTotal =
+    new Counter<CampaignSnapshotRecoveryLabel>({
+      name: 'boostad_campaign_snapshot_recovery_total',
+      help: 'Campaign snapshot full reload 횟수',
+      labelNames: ['reason'],
       registers: [this.registry],
     });
 
@@ -597,6 +630,25 @@ export class MetricsService {
 
   recordRtbAuctionTransition(operation: string, outcome: string) {
     this.rtbAuctionTransitionTotal.inc({ operation, outcome });
+  }
+
+  setCampaignSnapshotState(metadata: {
+    ready: boolean;
+    sequence: number;
+    size: number;
+    lastEventAtMs: number;
+  }) {
+    this.campaignSnapshotReady.set(metadata.ready ? 1 : 0);
+    this.campaignSnapshotSequence.set(metadata.sequence);
+    this.campaignSnapshotSize.set(metadata.size);
+    const ageSeconds = metadata.lastEventAtMs
+      ? Math.max(0, (Date.now() - metadata.lastEventAtMs) / 1000)
+      : 0;
+    this.campaignSnapshotLastEventAgeSeconds.set(ageSeconds);
+  }
+
+  recordCampaignSnapshotRecovery(reason: string) {
+    this.campaignSnapshotRecoveryTotal.inc({ reason });
   }
 
   observeRtbPayload(direction: 'request' | 'response', bytes: number) {
