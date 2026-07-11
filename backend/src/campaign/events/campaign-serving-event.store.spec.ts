@@ -55,4 +55,80 @@ describe('CampaignServingEventStore', () => {
       '1'
     );
   });
+
+  it('reads and validates complete serving documents after a checkpoint', async () => {
+    const fields = [
+      'schemaVersion',
+      '1',
+      'type',
+      'UPSERT',
+      'campaignId',
+      'campaign-1',
+      'campaignVersion',
+      '4',
+      'sequence',
+      '9',
+      'occurredAtMs',
+      '1000',
+      'payload',
+      JSON.stringify(campaign),
+    ];
+    const redis = {
+      xread: jest
+        .fn()
+        .mockResolvedValue([
+          ['rtb:campaign-serving:events', [['9-0', fields]]],
+        ]),
+    } as unknown as AppIORedisClient & { xread: jest.Mock };
+    const store = new CampaignServingEventStore(redis, config(true));
+
+    await expect(
+      store.readAfter('8-0', { count: 10, blockMs: 100 })
+    ).resolves.toEqual([
+      {
+        schemaVersion: 1,
+        eventId: '9-0',
+        type: 'UPSERT',
+        campaignId: 'campaign-1',
+        campaignVersion: 4,
+        sequence: 9,
+        occurredAtMs: 1000,
+        campaign,
+      },
+    ]);
+  });
+
+  it('returns the latest stream checkpoint', async () => {
+    const redis = {
+      xrevrange: jest
+        .fn()
+        .mockResolvedValue([
+          [
+            '12-0',
+            [
+              'schemaVersion',
+              '1',
+              'type',
+              'DELETE',
+              'campaignId',
+              'campaign-1',
+              'campaignVersion',
+              '5',
+              'sequence',
+              '12',
+              'occurredAtMs',
+              '1000',
+              'payload',
+              '',
+            ],
+          ],
+        ]),
+    } as unknown as AppIORedisClient & { xrevrange: jest.Mock };
+    const store = new CampaignServingEventStore(redis, config(true));
+
+    await expect(store.getCheckpoint()).resolves.toEqual({
+      eventId: '12-0',
+      sequence: 12,
+    });
+  });
 });

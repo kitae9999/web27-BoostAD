@@ -2,6 +2,7 @@ import { CampaignServingSnapshotService } from './campaign-serving-snapshot.serv
 import { CampaignCacheRepository } from './repository/campaign.cache.repository.interface';
 import type { CachedCampaign } from './types/campaign.types';
 import { ConfigService } from '@nestjs/config';
+import type { CampaignServingEvent } from './events/campaign-serving-event';
 
 describe('CampaignServingSnapshotService', () => {
   const embedding = Array.from({ length: 384 }, (_, index) => index / 384);
@@ -221,5 +222,70 @@ describe('CampaignServingSnapshotService', () => {
     const campaigns = await readInFlight;
 
     expect(campaigns[0].title).toBe('updated');
+  });
+
+  it('applies ordered serving events once and updates the tag index', async () => {
+    const first = { ...buildCampaign('c1'), tags: ['before'] };
+    const updated = { ...buildCampaign('c1'), tags: ['after'] };
+    const repository = buildRepository([first]);
+    const service = new CampaignServingSnapshotService(
+      repository,
+      configService
+    );
+    await service.findCampaignsByIds(['c1']);
+    const event: CampaignServingEvent = {
+      schemaVersion: 1,
+      eventId: '1-0',
+      type: 'UPSERT',
+      campaignId: 'c1',
+      campaignVersion: 1,
+      sequence: 1,
+      occurredAtMs: 1000,
+      campaign: updated,
+    };
+
+    expect(service.applyServingEvent(event)).toBe('applied');
+    const appliedVersion = service.getMetadata().version;
+    expect(service.applyServingEvent(event)).toBe('stale');
+    expect(service.getMetadata()).toMatchObject({
+      version: appliedVersion,
+      sequence: 1,
+      lastEventId: '1-0',
+      ready: true,
+    });
+    await expect(service.findCampaignsByTags(['before'])).resolves.toEqual([]);
+    await expect(
+      service
+        .findCampaignsByTags(['after'])
+        .then((campaigns) => campaigns.map((campaign) => campaign.id))
+    ).resolves.toEqual(['c1']);
+  });
+
+  it('closes readiness instead of applying an event across a sequence gap', async () => {
+    const first = buildCampaign('c1');
+    const repository = buildRepository([first]);
+    const service = new CampaignServingSnapshotService(
+      repository,
+      configService
+    );
+    await service.findCampaignsByIds(['c1']);
+
+    expect(
+      service.applyServingEvent({
+        schemaVersion: 1,
+        eventId: '2-0',
+        type: 'DELETE',
+        campaignId: 'c1',
+        campaignVersion: 1,
+        sequence: 2,
+        occurredAtMs: 2000,
+      })
+    ).toBe('gap');
+    expect(service.getMetadata()).toMatchObject({ ready: false, sequence: 0 });
+    await expect(
+      service
+        .findCampaignsByIds(['c1'])
+        .then((campaigns) => campaigns.map((campaign) => campaign.id))
+    ).resolves.toEqual(['c1']);
   });
 });

@@ -13,6 +13,11 @@ import {
   type CampaignCacheRemovedEvent,
   type CampaignCacheUpsertedEvent,
 } from './events/campaign-cache.events';
+import {
+  CAMPAIGN_SERVING_EVENT_SCHEMA_VERSION,
+  type CampaignServingEvent,
+  type CampaignServingEventCheckpoint,
+} from './events/campaign-serving-event';
 
 export type ServingCampaign = Omit<
   CachedCampaign,
@@ -27,9 +32,20 @@ type SnapshotMutation = ServingCampaign | null;
 type CampaignServingSnapshotState = {
   version: number;
   builtAtMs: number;
+  ready: boolean;
+  sequence: number;
+  lastEventId: string;
+  lastEventAtMs: number;
   campaignsById: ReadonlyMap<string, ServingCampaign>;
   campaignIdsByTag: ReadonlyMap<string, ReadonlySet<string>>;
+  campaignVersions: ReadonlyMap<string, number>;
 };
+
+export type CampaignServingEventApplyResult =
+  | 'applied'
+  | 'stale'
+  | 'gap'
+  | 'schema_mismatch';
 
 @Injectable()
 export class CampaignServingSnapshotService implements OnApplicationBootstrap {
@@ -37,8 +53,13 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
   private state: CampaignServingSnapshotState = {
     version: 0,
     builtAtMs: 0,
+    ready: false,
+    sequence: 0,
+    lastEventId: '0-0',
+    lastEventAtMs: 0,
     campaignsById: new Map(),
     campaignIdsByTag: new Map(),
+    campaignVersions: new Map(),
   };
   private initialized = false;
   private initializationInFlight: Promise<void> | null = null;
@@ -61,8 +82,7 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
       configService.get<string>(
         'RTB_DENSE_RETRIEVAL_MODE',
         'semantic_document'
-      ) ===
-      'semantic_document';
+      ) === 'semantic_document';
     const campaignSource = configService.get<string>('RTB_CAMPAIGN_SOURCE');
     this.enabled = campaignSource
       ? campaignSource === 'local_snapshot'
@@ -126,18 +146,30 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
     builtAtMs: number;
     size: number;
     tagCount: number;
+    ready: boolean;
+    sequence: number;
+    lastEventId: string;
+    lastEventAtMs: number;
   } {
     return {
       version: this.state.version,
       builtAtMs: this.state.builtAtMs,
       size: this.state.campaignsById.size,
       tagCount: this.state.campaignIdsByTag.size,
+      ready: this.state.ready,
+      sequence: this.state.sequence,
+      lastEventId: this.state.lastEventId,
+      lastEventAtMs: this.state.lastEventAtMs,
     };
   }
 
   @OnEvent(CAMPAIGN_CACHE_UPSERTED_EVENT)
   onCampaignCacheUpserted(event: CampaignCacheUpsertedEvent): void {
     if (!this.enabled) {
+      return;
+    }
+    if (event.servingEvent) {
+      this.applyServingEvent(event.servingEvent);
       return;
     }
     const campaign = this.toServingCampaign(event.campaign);
@@ -152,10 +184,81 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
     if (!this.enabled) {
       return;
     }
+    if (event.servingEvent) {
+      this.applyServingEvent(event.servingEvent);
+      return;
+    }
     this.recordMutation(event.campaignId, null);
     if (this.initialized) {
       this.remove(event.campaignId);
     }
+  }
+
+  applyServingEvent(
+    event: CampaignServingEvent
+  ): CampaignServingEventApplyResult {
+    if (event.schemaVersion !== CAMPAIGN_SERVING_EVENT_SCHEMA_VERSION) {
+      this.markNotReady();
+      return 'schema_mismatch';
+    }
+    if (event.sequence <= this.state.sequence) {
+      return 'stale';
+    }
+    if (event.sequence !== this.state.sequence + 1) {
+      this.markNotReady();
+      return 'gap';
+    }
+
+    const currentCampaignVersion =
+      this.state.campaignVersions.get(event.campaignId) ?? 0;
+    const campaignVersions = new Map(this.state.campaignVersions);
+    campaignVersions.set(event.campaignId, event.campaignVersion);
+    if (event.campaignVersion <= currentCampaignVersion) {
+      this.state = {
+        ...this.state,
+        sequence: event.sequence,
+        lastEventId: event.eventId,
+        lastEventAtMs: event.occurredAtMs,
+        campaignVersions,
+      };
+      return 'stale';
+    }
+
+    const campaignsById = new Map(this.state.campaignsById);
+    if (event.type === 'UPSERT') {
+      campaignsById.set(
+        event.campaignId,
+        this.toServingCampaign(event.campaign)
+      );
+    } else {
+      campaignsById.delete(event.campaignId);
+    }
+    this.state = {
+      ...this.state,
+      version: this.state.version + 1,
+      builtAtMs: Date.now(),
+      ready: true,
+      sequence: event.sequence,
+      lastEventId: event.eventId,
+      lastEventAtMs: event.occurredAtMs,
+      campaignsById,
+      campaignIdsByTag: this.buildTagIndex(campaignsById),
+      campaignVersions,
+    };
+    return 'applied';
+  }
+
+  setCheckpoint(checkpoint: CampaignServingEventCheckpoint): void {
+    this.state = {
+      ...this.state,
+      ready: true,
+      sequence: checkpoint.sequence,
+      lastEventId: checkpoint.eventId,
+    };
+  }
+
+  markNotReady(): void {
+    this.state = { ...this.state, ready: false };
   }
 
   private async ensureInitialized(): Promise<void> {
@@ -194,8 +297,13 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
     this.state = {
       version: this.state.version + 1,
       builtAtMs: Date.now(),
+      ready: true,
+      sequence: this.state.sequence,
+      lastEventId: this.state.lastEventId,
+      lastEventAtMs: this.state.lastEventAtMs,
       campaignsById,
       campaignIdsByTag: this.buildTagIndex(campaignsById),
+      campaignVersions: this.state.campaignVersions,
     };
     this.initialized = true;
     this.mutationsDuringInitialization.clear();
@@ -218,10 +326,12 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
       campaignsById.set(campaign.id, campaign);
     }
     this.state = {
+      ...this.state,
       version: this.state.version + 1,
       builtAtMs: Date.now(),
       campaignsById,
       campaignIdsByTag: this.buildTagIndex(campaignsById),
+      campaignVersions: this.state.campaignVersions,
     };
   }
 
@@ -233,10 +343,12 @@ export class CampaignServingSnapshotService implements OnApplicationBootstrap {
     const campaignsById = new Map(this.state.campaignsById);
     campaignsById.delete(campaignId);
     this.state = {
+      ...this.state,
       version: this.state.version + 1,
       builtAtMs: Date.now(),
       campaignsById,
       campaignIdsByTag: this.buildTagIndex(campaignsById),
+      campaignVersions: this.state.campaignVersions,
     };
   }
 

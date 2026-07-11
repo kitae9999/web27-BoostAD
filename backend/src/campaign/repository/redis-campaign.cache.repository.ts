@@ -657,8 +657,11 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       this.deleteCampaignDocumentVectorDoc(id),
     ]);
     this.allCampaignsCache = null;
-    await this.servingEventStore.publishDelete(id);
-    this.eventEmitter.emit(CAMPAIGN_CACHE_REMOVED_EVENT, { campaignId: id });
+    const servingEvent = await this.servingEventStore.publishDelete(id);
+    this.eventEmitter.emit(CAMPAIGN_CACHE_REMOVED_EVENT, {
+      campaignId: id,
+      ...(servingEvent ? { servingEvent } : {}),
+    });
     this.logger.debug(`캐시 삭제: ${id}`);
   }
 
@@ -844,10 +847,13 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
     durableEvent = true
   ): Promise<void> {
     this.allCampaignsCache = null;
-    if (durableEvent) {
-      await this.servingEventStore.publishUpsert(campaign);
-    }
-    this.eventEmitter.emit(CAMPAIGN_CACHE_UPSERTED_EVENT, { campaign });
+    const servingEvent = durableEvent
+      ? await this.servingEventStore.publishUpsert(campaign)
+      : null;
+    this.eventEmitter.emit(CAMPAIGN_CACHE_UPSERTED_EVENT, {
+      campaign,
+      ...(servingEvent ? { servingEvent } : {}),
+    });
   }
 
   /**
