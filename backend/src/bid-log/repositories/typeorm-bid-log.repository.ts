@@ -7,6 +7,8 @@ import { BidLog, BidStatus } from '../bid-log.types';
 
 @Injectable()
 export class TypeOrmBidLogRepository extends BidLogRepository {
+  private readonly conflictPaths = ['auctionId', 'campaignId'];
+
   constructor(
     @InjectRepository(BidLogEntity)
     private readonly repository: Repository<BidLogEntity>
@@ -20,13 +22,39 @@ export class TypeOrmBidLogRepository extends BidLogRepository {
   }
 
   async save(bidLog: BidLog): Promise<void> {
-    // await this.repository.save(bidLog);
-    await this.repository.insert(bidLog);
+    await this.repository.upsert(bidLog, this.conflictPaths);
   }
 
-  // Insert를 사용하면 저장된 결과값을 리턴해주지않으므로 save를 사용해야함
   async saveMany(bidLogs: BidLog[]): Promise<BidLog[]> {
-    return await this.repository.save(bidLogs);
+    if (bidLogs.length === 0) return [];
+
+    await this.repository.upsert(bidLogs, this.conflictPaths);
+
+    const persistedLogs = await this.repository.find({
+      where: bidLogs.map(({ auctionId, campaignId }) => ({
+        auctionId,
+        campaignId,
+      })),
+    });
+    const persistedByIdentity = new Map(
+      persistedLogs.map((log) => [this.getIdentity(log), log])
+    );
+
+    return bidLogs.map((bidLog) => {
+      const persisted = persistedByIdentity.get(this.getIdentity(bidLog));
+      if (!persisted) {
+        throw new Error(
+          `upsert된 BidLog를 조회할 수 없습니다: auction=${bidLog.auctionId}, campaign=${bidLog.campaignId}`
+        );
+      }
+      return persisted;
+    });
+  }
+
+  private getIdentity(
+    bidLog: Pick<BidLog, 'auctionId' | 'campaignId'>
+  ): string {
+    return JSON.stringify([bidLog.auctionId, bidLog.campaignId]);
   }
 
   async findByAuctionId(auctionId: string): Promise<BidLog[]> {
