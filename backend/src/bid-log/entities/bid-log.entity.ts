@@ -3,11 +3,15 @@ import {
   PrimaryGeneratedColumn,
   Column,
   CreateDateColumn,
+  Index,
 } from 'typeorm';
 
 import { BidStatus } from '../bid-log.types';
 
 @Entity('BidLog')
+@Index('uq_bidlog_auction_campaign', ['auctionId', 'campaignId'], {
+  unique: true,
+})
 export class BidLogEntity {
   @PrimaryGeneratedColumn()
   id: number;
