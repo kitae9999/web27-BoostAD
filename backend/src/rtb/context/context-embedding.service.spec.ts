@@ -1,21 +1,36 @@
+import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { MetricsService } from '../../metrics/metrics.service';
 import { MLEngine } from '../ml/mlEngine.interface';
 import { ContextEmbeddingService } from './context-embedding.service';
 import type { ContextEmbeddingJobData } from '../../queue/types/queue.type';
+import type { JobsOptions } from 'bullmq';
+
+type QueueAddArgs = [
+  name: string,
+  data: ContextEmbeddingJobData,
+  options?: JobsOptions,
+];
+
+type QueueAddResult = Promise<{ id: string }>;
 
 describe('ContextEmbeddingService', () => {
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+  });
+
   afterEach(() => {
     jest.useRealTimers();
+    jest.restoreAllMocks();
   });
 
   const buildRedis = () => {
     const store = new Map<string, string>();
     return {
       store,
-      get: jest.fn(async (key: string) => store.get(key) ?? null),
+      get: jest.fn((key: string) => store.get(key) ?? null),
       set: jest.fn(
-        async (key: string, value: string, ...args: Array<string | number>) => {
+        (key: string, value: string, ...args: Array<string | number>) => {
           if (args.includes('NX') && store.has(key)) {
             return null;
           }
@@ -23,7 +38,33 @@ describe('ContextEmbeddingService', () => {
           return 'OK';
         }
       ),
-      del: jest.fn(async (key: string) => (store.delete(key) ? 1 : 0)),
+      eval: jest.fn(
+        (
+          _script: string,
+          _numberOfKeys: number,
+          key: string,
+          pendingRaw: string
+        ) => {
+          const existingRaw = store.get(key);
+          if (existingRaw) {
+            try {
+              const existing = JSON.parse(existingRaw) as {
+                status?: string;
+              };
+              if (
+                existing.status === 'READY' ||
+                existing.status === 'PENDING'
+              ) {
+                return [0, existingRaw];
+              }
+            } catch {
+              // Lua와 동일하게 손상된 상태는 새 PENDING으로 교체한다.
+            }
+          }
+          store.set(key, pendingRaw);
+          return [1, pendingRaw];
+        }
+      ),
     };
   };
 
@@ -33,7 +74,11 @@ describe('ContextEmbeddingService', () => {
     config?: Record<string, string>;
   }) => {
     const redis = options?.redis ?? buildRedis();
-    const queue = { add: jest.fn().mockResolvedValue({ id: 'job' }) };
+    const queue = {
+      add: jest
+        .fn<QueueAddResult, QueueAddArgs>()
+        .mockResolvedValue({ id: 'job' }),
+    };
     const metrics = {
       recordRtbContextObserve: jest.fn(),
       recordRtbContextJob: jest.fn(),
@@ -92,7 +137,7 @@ describe('ContextEmbeddingService', () => {
       body: 'body',
       tags: ['tag'],
     });
-    const job = queue.add.mock.calls[0][1] as ContextEmbeddingJobData;
+    const job = queue.add.mock.calls[0][1];
 
     await service.completeJob(job, [0.1, 0.2, 0.3]);
 
@@ -128,18 +173,24 @@ describe('ContextEmbeddingService', () => {
     expect(queue.add).toHaveBeenCalledTimes(1);
   });
 
-  it('3C-U3: queue failure records FAILED and releases the job lock', async () => {
+  it('3C-U3: uncertain enqueue failures keep PENDING after retries', async () => {
     const harness = buildHarness();
     harness.queue.add.mockRejectedValue(new Error('queue down'));
 
-    const failed = await harness.service.observe({
+    const pending = await harness.service.observe({
       title: 'title',
       tags: [],
     });
 
-    expect(failed.status).toBe('FAILED');
-    expect(harness.redis.del).toHaveBeenCalledTimes(1);
+    expect(pending.status).toBe('PENDING');
+    expect(harness.queue.add).toHaveBeenCalledTimes(3);
+    await expect(harness.service.getState(pending.contextId)).resolves.toEqual(
+      pending
+    );
     expect(harness.metrics.recordRtbContextJob).toHaveBeenCalledWith('failed');
+    expect(harness.metrics.recordRtbContextObserve).toHaveBeenCalledWith(
+      'PENDING'
+    );
   });
 
   it('3C-U4: model version changes isolate the stored state', async () => {
@@ -172,14 +223,12 @@ describe('ContextEmbeddingService', () => {
     });
 
     const first = await harness.service.observe({ title: 'first', tags: [] });
-    const firstJob = harness.queue.add.mock
-      .calls[0][1] as ContextEmbeddingJobData;
+    const firstJob = harness.queue.add.mock.calls[0][1];
     await harness.service.completeJob(firstJob, [0.1, 0.2, 0.3]);
     await harness.service.resolveForDecision(first.contextId);
 
     const second = await harness.service.observe({ title: 'second', tags: [] });
-    const secondJob = harness.queue.add.mock
-      .calls[1][1] as ContextEmbeddingJobData;
+    const secondJob = harness.queue.add.mock.calls[1][1];
     await harness.service.completeJob(secondJob, [0.4, 0.5, 0.6]);
     await harness.service.resolveForDecision(second.contextId);
 
@@ -198,7 +247,7 @@ describe('ContextEmbeddingService', () => {
       config: { RTB_CONTEXT_L1_TTL_MS: '10' },
     });
     const pending = await harness.service.observe({ title: 'ttl', tags: [] });
-    const job = harness.queue.add.mock.calls[0][1] as ContextEmbeddingJobData;
+    const job = harness.queue.add.mock.calls[0][1];
     await harness.service.completeJob(job, [0.1, 0.2, 0.3]);
     await harness.service.resolveForDecision(pending.contextId);
     const readsAfterFirst = harness.redis.get.mock.calls.length;
@@ -216,7 +265,9 @@ describe('ContextEmbeddingService', () => {
     });
     const makeReady = async (title: string, embedding: number[]) => {
       const pending = await harness.service.observe({ title, tags: [] });
-      const job = harness.queue.add.mock.calls.at(-1)?.[1] as ContextEmbeddingJobData;
+      const job = harness.queue.add.mock.calls.at(
+        -1
+      )?.[1] as ContextEmbeddingJobData;
       await harness.service.completeJob(job, embedding);
       await harness.service.resolveForDecision(pending.contextId);
       return pending.contextId;
@@ -269,7 +320,7 @@ describe('ContextEmbeddingService', () => {
     ).resolves.toEqual({ status: 'PENDING' });
     expect(harness.service.getReadyL1Size()).toBe(0);
 
-    const job = harness.queue.add.mock.calls[0][1] as ContextEmbeddingJobData;
+    const job = harness.queue.add.mock.calls[0][1];
     await harness.service.failJob(job, new Error('boom'));
     await expect(
       harness.service.resolveForDecision(pending.contextId)
@@ -335,21 +386,68 @@ describe('ContextEmbeddingService', () => {
     expect(metrics.recordRtbContextJob).toHaveBeenCalledWith('deduplicated');
   });
 
-  it('3C-U8: FAILED observe can be retried after lock release', async () => {
+  it('3C-U8: enqueue response loss retries with the same jobId', async () => {
     const harness = buildHarness();
     harness.queue.add
-      .mockRejectedValueOnce(new Error('queue down'))
+      .mockRejectedValueOnce(new Error('response lost'))
       .mockResolvedValueOnce({ id: 'job-2' });
 
-    const failed = await harness.service.observe({ title: 'retry', tags: [] });
-    expect(failed.status).toBe('FAILED');
+    const pending = await harness.service.observe({
+      title: 'retry',
+      tags: [],
+    });
+
+    expect(pending.status).toBe('PENDING');
+    expect(harness.queue.add).toHaveBeenCalledTimes(2);
+    const firstOptions = harness.queue.add.mock.calls[0][2];
+    const secondOptions = harness.queue.add.mock.calls[1][2];
+    expect(secondOptions.jobId).toBe(firstOptions.jobId);
+    expect(secondOptions.removeOnComplete).toEqual({ age: 600 });
+    expect(secondOptions.removeOnFail).toBe(true);
+  });
+
+  it('3C-U9: lost enqueue responses never overwrite worker READY', async () => {
+    const harness = buildHarness();
+    let workerCompleted = false;
+    harness.queue.add.mockImplementation(
+      async (_name: string, job: ContextEmbeddingJobData) => {
+        if (!workerCompleted) {
+          workerCompleted = true;
+          await harness.service.completeJob(job, [0.1, 0.2, 0.3]);
+        }
+        throw new Error('response lost');
+      }
+    );
+
+    const observed = await harness.service.observe({
+      title: 'completed-before-response',
+      tags: [],
+    });
+
+    expect(observed.status).toBe('PENDING');
+    expect(harness.queue.add).toHaveBeenCalledTimes(3);
+    await expect(
+      harness.service.getState(observed.contextId)
+    ).resolves.toMatchObject({
+      status: 'READY',
+      embedding: [0.1, 0.2, 0.3],
+    });
+  });
+
+  it('3C-U10: worker FAILED state can atomically enqueue a new job', async () => {
+    const harness = buildHarness();
+    const pending = await harness.service.observe({ title: 'retry', tags: [] });
+    const job = harness.queue.add.mock.calls[0][1];
+    await harness.service.failJob(job, new Error('worker failed'));
 
     const retried = await harness.service.observe({ title: 'retry', tags: [] });
+
+    expect(pending.status).toBe('PENDING');
     expect(retried.status).toBe('PENDING');
     expect(harness.queue.add).toHaveBeenCalledTimes(2);
   });
 
-  it('3C-U9: PENDING re-observe during worker does not enqueue again', async () => {
+  it('3C-U11: PENDING re-observe during worker does not enqueue again', async () => {
     const { service, queue, metrics } = buildHarness();
     const first = await service.observe({ title: 'lock', tags: [] });
     expect(first.status).toBe('PENDING');

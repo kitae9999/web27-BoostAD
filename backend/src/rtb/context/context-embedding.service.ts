@@ -1,5 +1,10 @@
 import { createHash } from 'crypto';
-import { BadRequestException, Inject, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  Inject,
+  Injectable,
+  Logger,
+} from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { ConfigService } from '@nestjs/config';
 import { Queue } from 'bullmq';
@@ -39,12 +44,34 @@ type ReadyL1Entry = {
   expiresAtMs: number;
 };
 
+type PendingClaimResult = {
+  claimed: boolean;
+  state: ContextEmbeddingState;
+};
+
+const CLAIM_PENDING_SCRIPT = `
+local existingRaw = redis.call('GET', KEYS[1])
+
+if existingRaw then
+  local decoded, existing = pcall(cjson.decode, existingRaw)
+  if decoded and type(existing) == 'table'
+    and (existing.status == 'READY' or existing.status == 'PENDING') then
+    return {0, existingRaw}
+  end
+end
+
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return {1, ARGV[1]}
+`;
+
+const CONTEXT_ENQUEUE_MAX_ATTEMPTS = 3;
+
 @Injectable()
 export class ContextEmbeddingService {
+  private readonly logger = new Logger(ContextEmbeddingService.name);
   private readonly maxBodyChars: number;
   private readonly readyTtlSeconds: number;
   private readonly pendingTtlSeconds: number;
-  private readonly jobLockTtlSeconds: number;
   private readonly lookupBudgetMs: number;
   private readonly readyL1MaxSize: number;
   private readonly readyL1TtlMs: number;
@@ -68,10 +95,6 @@ export class ContextEmbeddingService {
     );
     this.pendingTtlSeconds = this.getPositiveInt(
       'RTB_CONTEXT_PENDING_TTL_SECONDS',
-      10 * 60
-    );
-    this.jobLockTtlSeconds = this.getPositiveInt(
-      'RTB_CONTEXT_JOB_LOCK_TTL_SECONDS',
       10 * 60
     );
     this.lookupBudgetMs = this.getPositiveInt(
@@ -119,32 +142,27 @@ export class ContextEmbeddingService {
       return existing;
     }
 
-    // 멀티 인스턴스에서 동시에 observe해도 job은 1번만 (SET NX + deterministic jobId)
-    const lockKey = this.buildJobLockKey(modelVersion, contentHash);
-    const claimed = await this.redis.set(
-      lockKey,
-      '1',
-      'EX',
-      this.jobLockTtlSeconds,
-      'NX'
-    );
-    if (claimed !== 'OK') {
-      const raced = await this.readState(stateKey);
-      const pending =
-        raced ??
-        this.buildState('PENDING', contextId, contentHash, modelVersion);
-      this.metricsService.recordRtbContextObserve(pending.status);
-      this.metricsService.recordRtbContextJob('deduplicated');
-      return pending;
-    }
-
     const pending = this.buildState(
       'PENDING',
       contextId,
       contentHash,
       modelVersion
     );
-    await this.writeState(stateKey, pending, this.pendingTtlSeconds);
+    // Lua가 상태 재확인과 PENDING 전이를 한 번에 실행해 동시 요청 중 하나만 선점한다.
+    const claim = await this.claimPendingState(stateKey, pending);
+    if (!claim.claimed) {
+      if (
+        claim.state.status === 'READY' &&
+        this.isValidEmbedding(claim.state.embedding)
+      ) {
+        this.setReadyL1(stateKey, claim.state.embedding);
+      }
+      this.metricsService.recordRtbContextObserve(claim.state.status);
+      if (claim.state.status === 'PENDING') {
+        this.metricsService.recordRtbContextJob('deduplicated');
+      }
+      return claim.state;
+    }
 
     const job: ContextEmbeddingJobData = {
       contextId,
@@ -152,35 +170,14 @@ export class ContextEmbeddingService {
       modelVersion,
       text: canonical.embeddingText,
     };
-    try {
-      // worker가 이 job을 받아 Xenova 실행 후 READY로 승격
-      await this.embeddingQueue.add('generate-context-embedding', job, {
-        jobId: this.buildJobId(modelVersion, contentHash),
-        removeOnComplete: true,
-        removeOnFail: 1_000,
-        attempts: 3,
-        backoff: { type: 'exponential', delay: 1_000 },
-      });
+    const enqueued = await this.enqueueContextEmbeddingJob(job);
+    if (enqueued) {
       this.metricsService.recordRtbContextJob('enqueued');
-      this.metricsService.recordRtbContextObserve('PENDING');
-      return pending;
-    } catch (error) {
-      const failed = this.buildState(
-        'FAILED',
-        contextId,
-        contentHash,
-        modelVersion,
-        undefined,
-        error instanceof Error ? error.message : String(error)
-      );
-      await Promise.all([
-        this.writeState(stateKey, failed, this.pendingTtlSeconds),
-        this.redis.del(lockKey),
-      ]);
+    } else {
       this.metricsService.recordRtbContextJob('failed');
-      this.metricsService.recordRtbContextObserve('FAILED');
-      return failed;
     }
+    this.metricsService.recordRtbContextObserve('PENDING');
+    return pending;
   }
 
   async getState(contextId: string): Promise<ContextEmbeddingState | null> {
@@ -263,14 +260,11 @@ export class ContextEmbeddingService {
       job.modelVersion,
       embedding
     );
-    await Promise.all([
-      this.writeState(
-        this.buildStateKey(job.modelVersion, job.contentHash),
-        state,
-        this.readyTtlSeconds
-      ),
-      this.redis.del(this.buildJobLockKey(job.modelVersion, job.contentHash)),
-    ]);
+    await this.writeState(
+      this.buildStateKey(job.modelVersion, job.contentHash),
+      state,
+      this.readyTtlSeconds
+    );
   }
 
   async failJob(job: ContextEmbeddingJobData, error: unknown): Promise<void> {
@@ -282,14 +276,11 @@ export class ContextEmbeddingService {
       undefined,
       error instanceof Error ? error.message : String(error)
     );
-    await Promise.all([
-      this.writeState(
-        this.buildStateKey(job.modelVersion, job.contentHash),
-        failed,
-        this.pendingTtlSeconds
-      ),
-      this.redis.del(this.buildJobLockKey(job.modelVersion, job.contentHash)),
-    ]);
+    await this.writeState(
+      this.buildStateKey(job.modelVersion, job.contentHash),
+      failed,
+      this.pendingTtlSeconds
+    );
   }
 
   private canonicalize(input: ContextObserveInput): {
@@ -330,16 +321,44 @@ export class ContextEmbeddingService {
     return `context-embedding:${modelVersion}:${contentHash}`;
   }
 
-  private buildJobLockKey(modelVersion: string, contentHash: string): string {
-    return `embedding-job:${modelVersion}:${contentHash}`;
-  }
-
   private buildJobId(modelVersion: string, contentHash: string): string {
     const versionHash = createHash('sha256')
       .update(modelVersion)
       .digest('hex')
       .slice(0, 16);
     return `context-${versionHash}-${contentHash}`;
+  }
+
+  private async enqueueContextEmbeddingJob(
+    job: ContextEmbeddingJobData
+  ): Promise<boolean> {
+    const jobId = this.buildJobId(job.modelVersion, job.contentHash);
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= CONTEXT_ENQUEUE_MAX_ATTEMPTS; attempt++) {
+      try {
+        // 같은 jobId를 재사용하면 첫 요청의 응답만 유실된 경우 BullMQ가 중복 생성을 막는다.
+        await this.embeddingQueue.add('generate-context-embedding', job, {
+          jobId,
+          // enqueue 재시도 전에 작업이 끝나도 jobId 중복 방지가 유지되도록 보존한다.
+          removeOnComplete: { age: this.pendingTtlSeconds },
+          // 최종 실패는 Redis 상태에 남기고, 다음 observe가 새 작업을 등록할 수 있게 제거한다.
+          removeOnFail: true,
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 1_000 },
+        });
+        return true;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    const reason =
+      lastError instanceof Error ? lastError.message : String(lastError);
+    this.logger.warn(
+      `Context embedding enqueue 결과를 확인하지 못해 PENDING을 유지합니다: ${reason}`
+    );
+    return false;
   }
 
   private buildState(
@@ -366,6 +385,10 @@ export class ContextEmbeddingService {
     if (!raw) {
       return null;
     }
+    return this.parseState(raw);
+  }
+
+  private parseState(raw: string): ContextEmbeddingState | null {
     try {
       const parsed = JSON.parse(raw) as ContextEmbeddingState;
       if (!['READY', 'PENDING', 'FAILED'].includes(parsed.status)) {
@@ -375,6 +398,35 @@ export class ContextEmbeddingService {
     } catch {
       return null;
     }
+  }
+
+  private async claimPendingState(
+    key: string,
+    pending: ContextEmbeddingState
+  ): Promise<PendingClaimResult> {
+    const rawResult = await this.redis.eval(
+      CLAIM_PENDING_SCRIPT,
+      1,
+      key,
+      JSON.stringify(pending),
+      String(this.pendingTtlSeconds)
+    );
+
+    if (!Array.isArray(rawResult) || rawResult.length !== 2) {
+      throw new Error(
+        'Context embedding PENDING claim 결과가 올바르지 않습니다.'
+      );
+    }
+
+    const state = this.parseState(String(rawResult[1]));
+    if (!state) {
+      throw new Error('Context embedding 상태를 해석할 수 없습니다.');
+    }
+
+    return {
+      claimed: Number(rawResult[0]) === 1,
+      state,
+    };
   }
 
   private async writeState(
@@ -438,7 +490,7 @@ export class ContextEmbeddingService {
         },
         (error) => {
           clearTimeout(timer);
-          reject(error);
+          reject(error instanceof Error ? error : new Error(String(error)));
         }
       );
     });

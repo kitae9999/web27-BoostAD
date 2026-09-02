@@ -34,7 +34,10 @@ export class SaveBidlogWorker extends WorkerHost {
   ) {
     super();
   }
-
+  /**
+   * DB에 경매정보 저장 + Redis PubSub 발행
+   * @param job 경매 정보 -> 경매 참여 캠페인 정보 + 블로그 정보
+   */
   async process(job: Job<BidLogJobData>) {
     if (job.name === 'save-bidlog') {
       const { auctionId, blogId, isHighIntent, behaviorScore, items } =

@@ -44,7 +44,9 @@ export class BidLogService implements OnModuleInit, OnModuleDestroy {
       await this.subscriber.subscribe(BID_LOG_CREATED_CHANNEL);
 
       this.subscriber.on('message', (channel, rawMessage) => {
+        // on메서드에 들어가는 두번째 인자가 채널로부터 메세지가 도착했을 때 실행할 콜백
         if (channel !== BID_LOG_CREATED_CHANNEL) {
+          // 이 subscriber는 채널한개만 구독하므로 굳이 필요없는 로직
           return;
         }
 

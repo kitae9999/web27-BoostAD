@@ -1,4 +1,4 @@
-import { Processor, WorkerHost } from '@nestjs/bullmq';
+import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
 import { Logger, OnApplicationBootstrap } from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
@@ -78,6 +78,24 @@ export class EmbeddingWorker
     }
   }
 
+  @OnWorkerEvent('failed')
+  async onWorkerFailed(job: Job | undefined, error: Error): Promise<void> {
+    if (!job || job.name !== 'generate-context-embedding') {
+      return;
+    }
+
+    const configuredAttempts = job.opts.attempts ?? 1;
+    if (job.attemptsMade < configuredAttempts) {
+      return;
+    }
+
+    // BullMQ가 최종 실패 작업을 제거한 뒤 상태를 열어 다음 observe가 재등록할 수 있게 한다.
+    await this.contextEmbeddingService.failJob(
+      job.data as ContextEmbeddingJobData,
+      error
+    );
+  }
+
   private async generateContextEmbedding(job: Job<ContextEmbeddingJobData>) {
     const startedAt = process.hrtime.bigint();
     try {
@@ -93,11 +111,6 @@ export class EmbeddingWorker
       await this.contextEmbeddingService.completeJob(job.data, embedding);
       this.metricsService.recordRtbContextJob('completed');
     } catch (error) {
-      const configuredAttempts = job.opts.attempts ?? 1;
-      const isFinalAttempt = job.attemptsMade + 1 >= configuredAttempts;
-      if (isFinalAttempt) {
-        await this.contextEmbeddingService.failJob(job.data, error);
-      }
       this.metricsService.recordRtbContextJob('failed');
       throw error;
     } finally {
