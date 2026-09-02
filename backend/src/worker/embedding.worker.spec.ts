@@ -104,7 +104,7 @@ describe('EmbeddingWorker lifecycle', () => {
   });
 
   it('rejects a context job from another model namespace', async () => {
-    const { worker, mlEngine } = buildWorker(true);
+    const { worker, mlEngine, contextEmbeddingService } = buildWorker(true);
 
     await expect(
       worker.process({
@@ -121,6 +121,44 @@ describe('EmbeddingWorker lifecycle', () => {
       } as unknown as Job)
     ).rejects.toThrow('context job model version 불일치');
     expect(mlEngine.getEmbedding).not.toHaveBeenCalled();
+    expect(contextEmbeddingService.failJob).not.toHaveBeenCalled();
+  });
+
+  it('records FAILED only after BullMQ exhausts all attempts', async () => {
+    const { worker, contextEmbeddingService } = buildWorker(true);
+    const error = new Error('embedding failed');
+    const job = {
+      name: 'generate-context-embedding',
+      data: {
+        contextId: `ctx_${'c'.repeat(64)}`,
+        contentHash: 'c'.repeat(64),
+        modelVersion: 'model-v2',
+        text: '본문',
+      },
+      opts: { attempts: 3 },
+      attemptsMade: 3,
+    } as unknown as Job;
+
+    await worker.onWorkerFailed(job, error);
+
+    expect(contextEmbeddingService.failJob).toHaveBeenCalledWith(
+      job.data,
+      error
+    );
+  });
+
+  it('keeps PENDING while BullMQ still has a retry attempt', async () => {
+    const { worker, contextEmbeddingService } = buildWorker(true);
+    const job = {
+      name: 'generate-context-embedding',
+      data: {},
+      opts: { attempts: 3 },
+      attemptsMade: 2,
+    } as unknown as Job;
+
+    await worker.onWorkerFailed(job, new Error('retrying'));
+
+    expect(contextEmbeddingService.failJob).not.toHaveBeenCalled();
   });
 
   it('publishes campaign tag and document embeddings from passage inputs', async () => {

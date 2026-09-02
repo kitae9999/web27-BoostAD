@@ -1,5 +1,10 @@
 import { createHash } from 'crypto';
-import { BadRequestException, Inject, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  Inject,
+  Injectable,
+  Logger,
+} from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { ConfigService } from '@nestjs/config';
 import { Queue } from 'bullmq';
@@ -59,8 +64,11 @@ redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
 return {1, ARGV[1]}
 `;
 
+const CONTEXT_ENQUEUE_MAX_ATTEMPTS = 3;
+
 @Injectable()
 export class ContextEmbeddingService {
+  private readonly logger = new Logger(ContextEmbeddingService.name);
   private readonly maxBodyChars: number;
   private readonly readyTtlSeconds: number;
   private readonly pendingTtlSeconds: number;
@@ -162,32 +170,14 @@ export class ContextEmbeddingService {
       modelVersion,
       text: canonical.embeddingText,
     };
-    try {
-      // worker가 이 job을 받아 Xenova 실행 후 READY로 승격
-      await this.embeddingQueue.add('generate-context-embedding', job, {
-        jobId: this.buildJobId(modelVersion, contentHash),
-        removeOnComplete: true,
-        removeOnFail: 1_000,
-        attempts: 3,
-        backoff: { type: 'exponential', delay: 1_000 },
-      });
+    const enqueued = await this.enqueueContextEmbeddingJob(job);
+    if (enqueued) {
       this.metricsService.recordRtbContextJob('enqueued');
-      this.metricsService.recordRtbContextObserve('PENDING');
-      return pending;
-    } catch (error) {
-      const failed = this.buildState(
-        'FAILED',
-        contextId,
-        contentHash,
-        modelVersion,
-        undefined,
-        error instanceof Error ? error.message : String(error)
-      );
-      await this.writeState(stateKey, failed, this.pendingTtlSeconds);
+    } else {
       this.metricsService.recordRtbContextJob('failed');
-      this.metricsService.recordRtbContextObserve('FAILED');
-      return failed;
     }
+    this.metricsService.recordRtbContextObserve('PENDING');
+    return pending;
   }
 
   async getState(contextId: string): Promise<ContextEmbeddingState | null> {
@@ -339,6 +329,38 @@ export class ContextEmbeddingService {
     return `context-${versionHash}-${contentHash}`;
   }
 
+  private async enqueueContextEmbeddingJob(
+    job: ContextEmbeddingJobData
+  ): Promise<boolean> {
+    const jobId = this.buildJobId(job.modelVersion, job.contentHash);
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= CONTEXT_ENQUEUE_MAX_ATTEMPTS; attempt++) {
+      try {
+        // 같은 jobId를 재사용하면 첫 요청의 응답만 유실된 경우 BullMQ가 중복 생성을 막는다.
+        await this.embeddingQueue.add('generate-context-embedding', job, {
+          jobId,
+          // enqueue 재시도 전에 작업이 끝나도 jobId 중복 방지가 유지되도록 보존한다.
+          removeOnComplete: { age: this.pendingTtlSeconds },
+          // 최종 실패는 Redis 상태에 남기고, 다음 observe가 새 작업을 등록할 수 있게 제거한다.
+          removeOnFail: true,
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 1_000 },
+        });
+        return true;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    const reason =
+      lastError instanceof Error ? lastError.message : String(lastError);
+    this.logger.warn(
+      `Context embedding enqueue 결과를 확인하지 못해 PENDING을 유지합니다: ${reason}`
+    );
+    return false;
+  }
+
   private buildState(
     status: ContextEmbeddingStatus,
     contextId: string,
@@ -468,7 +490,7 @@ export class ContextEmbeddingService {
         },
         (error) => {
           clearTimeout(timer);
-          reject(error);
+          reject(error instanceof Error ? error : new Error(String(error)));
         }
       );
     });
