@@ -39,12 +39,31 @@ type ReadyL1Entry = {
   expiresAtMs: number;
 };
 
+type PendingClaimResult = {
+  claimed: boolean;
+  state: ContextEmbeddingState;
+};
+
+const CLAIM_PENDING_SCRIPT = `
+local existingRaw = redis.call('GET', KEYS[1])
+
+if existingRaw then
+  local decoded, existing = pcall(cjson.decode, existingRaw)
+  if decoded and type(existing) == 'table'
+    and (existing.status == 'READY' or existing.status == 'PENDING') then
+    return {0, existingRaw}
+  end
+end
+
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return {1, ARGV[1]}
+`;
+
 @Injectable()
 export class ContextEmbeddingService {
   private readonly maxBodyChars: number;
   private readonly readyTtlSeconds: number;
   private readonly pendingTtlSeconds: number;
-  private readonly jobLockTtlSeconds: number;
   private readonly lookupBudgetMs: number;
   private readonly readyL1MaxSize: number;
   private readonly readyL1TtlMs: number;
@@ -68,10 +87,6 @@ export class ContextEmbeddingService {
     );
     this.pendingTtlSeconds = this.getPositiveInt(
       'RTB_CONTEXT_PENDING_TTL_SECONDS',
-      10 * 60
-    );
-    this.jobLockTtlSeconds = this.getPositiveInt(
-      'RTB_CONTEXT_JOB_LOCK_TTL_SECONDS',
       10 * 60
     );
     this.lookupBudgetMs = this.getPositiveInt(
@@ -119,32 +134,27 @@ export class ContextEmbeddingService {
       return existing;
     }
 
-    // 멀티 인스턴스에서 동시에 observe해도 job은 1번만 (SET NX + deterministic jobId)
-    const lockKey = this.buildJobLockKey(modelVersion, contentHash);
-    const claimed = await this.redis.set(
-      lockKey,
-      '1',
-      'EX',
-      this.jobLockTtlSeconds,
-      'NX'
-    );
-    if (claimed !== 'OK') {
-      const raced = await this.readState(stateKey);
-      const pending =
-        raced ??
-        this.buildState('PENDING', contextId, contentHash, modelVersion);
-      this.metricsService.recordRtbContextObserve(pending.status);
-      this.metricsService.recordRtbContextJob('deduplicated');
-      return pending;
-    }
-
     const pending = this.buildState(
       'PENDING',
       contextId,
       contentHash,
       modelVersion
     );
-    await this.writeState(stateKey, pending, this.pendingTtlSeconds);
+    // Lua가 상태 재확인과 PENDING 전이를 한 번에 실행해 동시 요청 중 하나만 선점한다.
+    const claim = await this.claimPendingState(stateKey, pending);
+    if (!claim.claimed) {
+      if (
+        claim.state.status === 'READY' &&
+        this.isValidEmbedding(claim.state.embedding)
+      ) {
+        this.setReadyL1(stateKey, claim.state.embedding);
+      }
+      this.metricsService.recordRtbContextObserve(claim.state.status);
+      if (claim.state.status === 'PENDING') {
+        this.metricsService.recordRtbContextJob('deduplicated');
+      }
+      return claim.state;
+    }
 
     const job: ContextEmbeddingJobData = {
       contextId,
@@ -173,10 +183,7 @@ export class ContextEmbeddingService {
         undefined,
         error instanceof Error ? error.message : String(error)
       );
-      await Promise.all([
-        this.writeState(stateKey, failed, this.pendingTtlSeconds),
-        this.redis.del(lockKey),
-      ]);
+      await this.writeState(stateKey, failed, this.pendingTtlSeconds);
       this.metricsService.recordRtbContextJob('failed');
       this.metricsService.recordRtbContextObserve('FAILED');
       return failed;
@@ -263,14 +270,11 @@ export class ContextEmbeddingService {
       job.modelVersion,
       embedding
     );
-    await Promise.all([
-      this.writeState(
-        this.buildStateKey(job.modelVersion, job.contentHash),
-        state,
-        this.readyTtlSeconds
-      ),
-      this.redis.del(this.buildJobLockKey(job.modelVersion, job.contentHash)),
-    ]);
+    await this.writeState(
+      this.buildStateKey(job.modelVersion, job.contentHash),
+      state,
+      this.readyTtlSeconds
+    );
   }
 
   async failJob(job: ContextEmbeddingJobData, error: unknown): Promise<void> {
@@ -282,14 +286,11 @@ export class ContextEmbeddingService {
       undefined,
       error instanceof Error ? error.message : String(error)
     );
-    await Promise.all([
-      this.writeState(
-        this.buildStateKey(job.modelVersion, job.contentHash),
-        failed,
-        this.pendingTtlSeconds
-      ),
-      this.redis.del(this.buildJobLockKey(job.modelVersion, job.contentHash)),
-    ]);
+    await this.writeState(
+      this.buildStateKey(job.modelVersion, job.contentHash),
+      failed,
+      this.pendingTtlSeconds
+    );
   }
 
   private canonicalize(input: ContextObserveInput): {
@@ -330,10 +331,6 @@ export class ContextEmbeddingService {
     return `context-embedding:${modelVersion}:${contentHash}`;
   }
 
-  private buildJobLockKey(modelVersion: string, contentHash: string): string {
-    return `embedding-job:${modelVersion}:${contentHash}`;
-  }
-
   private buildJobId(modelVersion: string, contentHash: string): string {
     const versionHash = createHash('sha256')
       .update(modelVersion)
@@ -366,6 +363,10 @@ export class ContextEmbeddingService {
     if (!raw) {
       return null;
     }
+    return this.parseState(raw);
+  }
+
+  private parseState(raw: string): ContextEmbeddingState | null {
     try {
       const parsed = JSON.parse(raw) as ContextEmbeddingState;
       if (!['READY', 'PENDING', 'FAILED'].includes(parsed.status)) {
@@ -375,6 +376,35 @@ export class ContextEmbeddingService {
     } catch {
       return null;
     }
+  }
+
+  private async claimPendingState(
+    key: string,
+    pending: ContextEmbeddingState
+  ): Promise<PendingClaimResult> {
+    const rawResult = await this.redis.eval(
+      CLAIM_PENDING_SCRIPT,
+      1,
+      key,
+      JSON.stringify(pending),
+      String(this.pendingTtlSeconds)
+    );
+
+    if (!Array.isArray(rawResult) || rawResult.length !== 2) {
+      throw new Error(
+        'Context embedding PENDING claim 결과가 올바르지 않습니다.'
+      );
+    }
+
+    const state = this.parseState(String(rawResult[1]));
+    if (!state) {
+      throw new Error('Context embedding 상태를 해석할 수 없습니다.');
+    }
+
+    return {
+      claimed: Number(rawResult[0]) === 1,
+      state,
+    };
   }
 
   private async writeState(

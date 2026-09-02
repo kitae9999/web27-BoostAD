@@ -23,7 +23,33 @@ describe('ContextEmbeddingService', () => {
           return 'OK';
         }
       ),
-      del: jest.fn(async (key: string) => (store.delete(key) ? 1 : 0)),
+      eval: jest.fn(
+        (
+          _script: string,
+          _numberOfKeys: number,
+          key: string,
+          pendingRaw: string
+        ) => {
+          const existingRaw = store.get(key);
+          if (existingRaw) {
+            try {
+              const existing = JSON.parse(existingRaw) as {
+                status?: string;
+              };
+              if (
+                existing.status === 'READY' ||
+                existing.status === 'PENDING'
+              ) {
+                return [0, existingRaw];
+              }
+            } catch {
+              // Lua와 동일하게 손상된 상태는 새 PENDING으로 교체한다.
+            }
+          }
+          store.set(key, pendingRaw);
+          return [1, pendingRaw];
+        }
+      ),
     };
   };
 
@@ -128,7 +154,7 @@ describe('ContextEmbeddingService', () => {
     expect(queue.add).toHaveBeenCalledTimes(1);
   });
 
-  it('3C-U3: queue failure records FAILED and releases the job lock', async () => {
+  it('3C-U3: queue failure records FAILED', async () => {
     const harness = buildHarness();
     harness.queue.add.mockRejectedValue(new Error('queue down'));
 
@@ -138,7 +164,6 @@ describe('ContextEmbeddingService', () => {
     });
 
     expect(failed.status).toBe('FAILED');
-    expect(harness.redis.del).toHaveBeenCalledTimes(1);
     expect(harness.metrics.recordRtbContextJob).toHaveBeenCalledWith('failed');
   });
 
@@ -216,7 +241,9 @@ describe('ContextEmbeddingService', () => {
     });
     const makeReady = async (title: string, embedding: number[]) => {
       const pending = await harness.service.observe({ title, tags: [] });
-      const job = harness.queue.add.mock.calls.at(-1)?.[1] as ContextEmbeddingJobData;
+      const job = harness.queue.add.mock.calls.at(
+        -1
+      )?.[1] as ContextEmbeddingJobData;
       await harness.service.completeJob(job, embedding);
       await harness.service.resolveForDecision(pending.contextId);
       return pending.contextId;
@@ -335,7 +362,7 @@ describe('ContextEmbeddingService', () => {
     expect(metrics.recordRtbContextJob).toHaveBeenCalledWith('deduplicated');
   });
 
-  it('3C-U8: FAILED observe can be retried after lock release', async () => {
+  it('3C-U8: FAILED observe can atomically claim PENDING again', async () => {
     const harness = buildHarness();
     harness.queue.add
       .mockRejectedValueOnce(new Error('queue down'))
