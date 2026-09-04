@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import Redis from 'ioredis';
 import { Queue } from 'bullmq';
+import { ConfigService } from '@nestjs/config';
 import { resolveEmbeddingQueueName } from '../../queue/queue.names';
 import {
   resolveEmbeddingProfile,
@@ -13,6 +14,11 @@ import { AVAILABLE_TAGS } from '../../common/constants';
 import { CampaignEntity, CampaignStatus } from '../entities/campaign.entity';
 import { TagEntity } from '../../tag/entities/tag.entity';
 import { UserEntity } from '../../user/entities/user.entity';
+import { resolveRedisConnection } from '../../redis/redis.config';
+import { CampaignProjectionOutboxWriter } from '../projection/campaign-projection-outbox.writer';
+import { CampaignProjectionEventType } from '../projection/campaign-projection.types';
+import { REDIS_APPLY_BUDGET_PROJECTION_SCRIPT } from './budget-lua-script';
+import { REDIS_APPLY_SEARCH_PROJECTION_SCRIPT } from './search-projection-lua-script';
 
 config({ path: join(__dirname, '../../../.env') });
 
@@ -76,6 +82,21 @@ const REDIS_CLEANUP_PATTERNS = [
   'dedup:click:*',
   'rtb:reservation:expirations',
 ];
+const SPLIT_SEARCH_CLEANUP_PATTERNS = [
+  'campaign:*',
+  'campaign-tag-vec:*',
+  'campaign-tag-vec-keys:*',
+  'campaign-doc-vec:*',
+];
+const SPLIT_BUDGET_CLEANUP_PATTERNS = [
+  'budget:campaign:*',
+  'auction:*',
+  'rtb:reservation:*',
+  'rollback:view:*',
+  'backup:rollback:view:*',
+  'dedup:view:*',
+  'dedup:click:*',
+];
 
 const THEMES: Record<ThemeId, Theme> = {
   frontend: {
@@ -89,7 +110,13 @@ const THEMES: Record<ThemeId, Theme> = {
       '컴포넌트 팩',
     ],
     lowIntentOffers: ['가이드', '튜토리얼', '샘플킷', '웨비나', '체크리스트'],
-    highIntentOffers: ['도입 상담', '무료 데모', '견적 상담', '전환 랜딩', 'PoC 제안'],
+    highIntentOffers: [
+      '도입 상담',
+      '무료 데모',
+      '견적 상담',
+      '전환 랜딩',
+      'PoC 제안',
+    ],
     benefitPhrases: [
       '초기 구축 시간을 줄이는 실무 템플릿입니다.',
       '운영 화면을 빠르게 검증할 수 있는 구성입니다.',
@@ -118,8 +145,20 @@ const THEMES: Record<ThemeId, Theme> = {
       '어드민 API',
       '데이터 파이프라인',
     ],
-    lowIntentOffers: ['구축 가이드', '실무 예제', '샘플 코드', '기술 브리프', '워크숍'],
-    highIntentOffers: ['도입 문의', '기술 상담', '엔터프라이즈 데모', '견적 비교', 'PoC 제안'],
+    lowIntentOffers: [
+      '구축 가이드',
+      '실무 예제',
+      '샘플 코드',
+      '기술 브리프',
+      '워크숍',
+    ],
+    highIntentOffers: [
+      '도입 문의',
+      '기술 상담',
+      '엔터프라이즈 데모',
+      '견적 비교',
+      'PoC 제안',
+    ],
     benefitPhrases: [
       '운영 환경에 맞춘 API 구조를 바로 검증할 수 있습니다.',
       '장애 대응과 배포 편의성을 함께 고려한 구성이 포함됩니다.',
@@ -148,8 +187,20 @@ const THEMES: Record<ThemeId, Theme> = {
       'K8s 운영킷',
       'SRE 스타터',
     ],
-    lowIntentOffers: ['체크리스트', '운영 가이드', '진단 세션', '샘플 파이프라인', '웨비나'],
-    highIntentOffers: ['비용 진단', '전환 상담', '데모 요청', '엔터프라이즈 제안', '도입 상담'],
+    lowIntentOffers: [
+      '체크리스트',
+      '운영 가이드',
+      '진단 세션',
+      '샘플 파이프라인',
+      '웨비나',
+    ],
+    highIntentOffers: [
+      '비용 진단',
+      '전환 상담',
+      '데모 요청',
+      '엔터프라이즈 제안',
+      '도입 상담',
+    ],
     benefitPhrases: [
       '배포 표준화와 비용 통제를 동시에 검토할 수 있습니다.',
       '운영 자동화 범위를 빠르게 정의하기 위한 제안입니다.',
@@ -178,8 +229,20 @@ const THEMES: Record<ThemeId, Theme> = {
       'RAG 스타터',
       '추천 엔진',
     ],
-    lowIntentOffers: ['사례집', '실습 세션', '샘플 프로젝트', '가이드', '튜토리얼'],
-    highIntentOffers: ['무료 진단', 'PoC 상담', '데모 요청', 'ROI 상담', '전환 상담'],
+    lowIntentOffers: [
+      '사례집',
+      '실습 세션',
+      '샘플 프로젝트',
+      '가이드',
+      '튜토리얼',
+    ],
+    highIntentOffers: [
+      '무료 진단',
+      'PoC 상담',
+      '데모 요청',
+      'ROI 상담',
+      '전환 상담',
+    ],
     benefitPhrases: [
       '생산성 실험을 빠르게 진행할 수 있는 구성을 제공합니다.',
       '사내 데이터와 모델 활용 범위를 검증하기 좋습니다.',
@@ -208,8 +271,20 @@ const THEMES: Record<ThemeId, Theme> = {
       '리포팅 자동화',
       '데이터 마트',
     ],
-    lowIntentOffers: ['설계 가이드', '사례 공유', '샘플 리포트', '체크리스트', '워크숍'],
-    highIntentOffers: ['구축 상담', '데모 세션', '비용 상담', '전환 제안', '무료 진단'],
+    lowIntentOffers: [
+      '설계 가이드',
+      '사례 공유',
+      '샘플 리포트',
+      '체크리스트',
+      '워크숍',
+    ],
+    highIntentOffers: [
+      '구축 상담',
+      '데모 세션',
+      '비용 상담',
+      '전환 제안',
+      '무료 진단',
+    ],
     benefitPhrases: [
       '분산된 운영 지표를 한 흐름으로 묶기 위한 상품입니다.',
       '리포트 작성 비용을 줄이는 자동화 구성을 담았습니다.',
@@ -238,8 +313,20 @@ const THEMES: Record<ThemeId, Theme> = {
       '팀 운영허브',
       '실시간 코멘트킷',
     ],
-    lowIntentOffers: ['사용 가이드', '업무 템플릿', '튜토리얼', '샘플 보드', '베스트 프랙티스'],
-    highIntentOffers: ['전환 상담', '팀 데모', '요금 상담', '도입 진단', '무료 체험'],
+    lowIntentOffers: [
+      '사용 가이드',
+      '업무 템플릿',
+      '튜토리얼',
+      '샘플 보드',
+      '베스트 프랙티스',
+    ],
+    highIntentOffers: [
+      '전환 상담',
+      '팀 데모',
+      '요금 상담',
+      '도입 진단',
+      '무료 체험',
+    ],
     benefitPhrases: [
       '원격 협업 흐름을 빠르게 정리할 수 있는 구성을 제공합니다.',
       '실시간 편집과 알림 기능을 한 번에 검토하기 좋습니다.',
@@ -268,8 +355,20 @@ const THEMES: Record<ThemeId, Theme> = {
       '커리큘럼 키트',
       '스터디 허브',
     ],
-    lowIntentOffers: ['무료 강의', '입문 가이드', '튜토리얼', '체험 강좌', '샘플 레슨'],
-    highIntentOffers: ['수강 상담', 'B2B 제안', '교육 데모', '무료 상담', '도입 문의'],
+    lowIntentOffers: [
+      '무료 강의',
+      '입문 가이드',
+      '튜토리얼',
+      '체험 강좌',
+      '샘플 레슨',
+    ],
+    highIntentOffers: [
+      '수강 상담',
+      'B2B 제안',
+      '교육 데모',
+      '무료 상담',
+      '도입 문의',
+    ],
     benefitPhrases: [
       '학습 전환율을 높이기 위한 실습형 랜딩 구성을 제공합니다.',
       '초보자 유입부터 팀 교육까지 연결되는 상품입니다.',
@@ -298,8 +397,20 @@ const THEMES: Record<ThemeId, Theme> = {
       '실시간 매치팩',
       '커뮤니티 시즌패스',
     ],
-    lowIntentOffers: ['트레일러', '사전예약 가이드', '체험판', '티저 캠페인', '런칭 노트'],
-    highIntentOffers: ['사전등록', '무료 체험', '시즌 오픈', '런칭 데모', '프로모션 문의'],
+    lowIntentOffers: [
+      '트레일러',
+      '사전예약 가이드',
+      '체험판',
+      '티저 캠페인',
+      '런칭 노트',
+    ],
+    highIntentOffers: [
+      '사전등록',
+      '무료 체험',
+      '시즌 오픈',
+      '런칭 데모',
+      '프로모션 문의',
+    ],
     benefitPhrases: [
       '커뮤니티 확장과 실시간 참여를 동시에 노리는 상품입니다.',
       '런칭 직전 모객 성능을 검증하기 위한 전환형 캠페인입니다.',
@@ -329,7 +440,13 @@ const THEMES: Record<ThemeId, Theme> = {
       '모바일 전환팩',
     ],
     lowIntentOffers: ['샘플 앱', '실무 가이드', '튜토리얼', '체험판', '워크숍'],
-    highIntentOffers: ['앱 데모', '전환 상담', '출시 제안', '무료 진단', 'PoC 상담'],
+    highIntentOffers: [
+      '앱 데모',
+      '전환 상담',
+      '출시 제안',
+      '무료 진단',
+      'PoC 상담',
+    ],
     benefitPhrases: [
       '모바일 출시 직전 필요한 핵심 화면을 빠르게 검증할 수 있습니다.',
       '크로스플랫폼 전환 비용을 줄이기 위한 실무형 패키지입니다.',
@@ -358,8 +475,20 @@ const THEMES: Record<ThemeId, Theme> = {
       '연동 스타터',
       '프로토콜 전환킷',
     ],
-    lowIntentOffers: ['설계 가이드', '실습 세션', '샘플 명세', '튜토리얼', '베스트 프랙티스'],
-    highIntentOffers: ['기술 상담', '도입 문의', 'PoC 제안', '무료 데모', '견적 상담'],
+    lowIntentOffers: [
+      '설계 가이드',
+      '실습 세션',
+      '샘플 명세',
+      '튜토리얼',
+      '베스트 프랙티스',
+    ],
+    highIntentOffers: [
+      '기술 상담',
+      '도입 문의',
+      'PoC 제안',
+      '무료 데모',
+      '견적 상담',
+    ],
     benefitPhrases: [
       '팀 간 인터페이스 차이를 줄이기 위한 제안입니다.',
       '연동 실패 비용을 줄이는 표준 명세 구성을 제공합니다.',
@@ -599,7 +728,10 @@ function buildContent(
     ? '비교표와 데모 요청 흐름까지 바로 연결됩니다.'
     : '실무 예제와 체크리스트를 바로 확인할 수 있습니다.';
 
-  return clampText(`${leadingTags} 기반 상품입니다. ${benefit} ${callToAction}`, 100);
+  return clampText(
+    `${leadingTags} 기반 상품입니다. ${benefit} ${callToAction}`,
+    100
+  );
 }
 
 function buildCampaignSeed(
@@ -621,12 +753,7 @@ function buildCampaignSeed(
       rng
     )
   );
-  const maxCpc = steppedRandom(
-    theme.cpcRange[0],
-    theme.cpcRange[1],
-    100,
-    rng
-  );
+  const maxCpc = steppedRandom(theme.cpcRange[0], theme.cpcRange[1], 100, rng);
   const dailyBudget = steppedRandom(
     theme.dailyBudgetRange[0],
     theme.dailyBudgetRange[1],
@@ -634,7 +761,10 @@ function buildCampaignSeed(
     rng
   );
   const totalBudgetMultiplier = steppedRandom(20, 90, 5, rng);
-  const totalBudget = Math.max(dailyBudget * 2, dailyBudget * totalBudgetMultiplier);
+  const totalBudget = Math.max(
+    dailyBudget * 2,
+    dailyBudget * totalBudgetMultiplier
+  );
   const campaignNumber = campaignIndex + 1;
   const slugBase = buildSlug(`${profile.brand}-${theme.id}-${campaignNumber}`);
   const title = buildTitle(profile, theme, isHighIntent, rng);
@@ -670,8 +800,13 @@ function buildSeedCampaigns(
   const campaigns: CampaignSeed[] = [];
 
   for (const profile of profiles) {
-    for (let campaignIndex = 0; campaignIndex < campaignsPerUser; campaignIndex += 1) {
-      const theme = THEMES[profile.themes[campaignIndex % profile.themes.length]];
+    for (
+      let campaignIndex = 0;
+      campaignIndex < campaignsPerUser;
+      campaignIndex += 1
+    ) {
+      const theme =
+        THEMES[profile.themes[campaignIndex % profile.themes.length]];
       campaigns.push(buildCampaignSeed(profile, theme, campaignIndex, rng));
     }
   }
@@ -716,6 +851,7 @@ function toCachedCampaign(campaign: CampaignEntity) {
   return {
     id: campaign.id,
     userId: campaign.userId,
+    servingVersion: Number(campaign.servingVersion),
     title: campaign.title,
     content: campaign.content,
     image: campaign.image,
@@ -741,7 +877,10 @@ function toCachedCampaign(campaign: CampaignEntity) {
   };
 }
 
-async function deleteKeysByPattern(redis: Redis, pattern: string): Promise<number> {
+async function deleteKeysByPattern(
+  redis: Redis,
+  pattern: string
+): Promise<number> {
   let cursor = '0';
   let deleted = 0;
 
@@ -779,6 +918,11 @@ async function syncRedisAndQueue(
     return;
   }
 
+  if (process.env.REDIS_TOPOLOGY_MODE === 'split') {
+    await syncSplitRedisAndQueue(campaigns, enqueueEmbeddings);
+    return;
+  }
+
   const redis = new Redis({
     host: process.env.REDIS_HOST || 'localhost',
     port: envInt('REDIS_PORT', 16379),
@@ -787,15 +931,18 @@ async function syncRedisAndQueue(
   const embeddingProfile = resolveEmbeddingProfile(
     process.env.RTB_EMBEDDING_PROFILE
   );
-  const queue = new Queue(resolveEmbeddingQueueName(
-    process.env.RTB_EMBEDDING_PROFILE,
-    process.env.RTB_EMBEDDING_QUEUE_NAME
-  ), {
-    connection: {
-      host: process.env.REDIS_HOST || 'localhost',
-      port: envInt('REDIS_PORT', 16379),
-    },
-  });
+  const queue = new Queue(
+    resolveEmbeddingQueueName(
+      process.env.RTB_EMBEDDING_PROFILE,
+      process.env.RTB_EMBEDDING_QUEUE_NAME
+    ),
+    {
+      connection: {
+        host: process.env.REDIS_HOST || 'localhost',
+        port: envInt('REDIS_PORT', 16379),
+      },
+    }
+  );
 
   try {
     let cleanedKeys = 0;
@@ -809,7 +956,12 @@ async function syncRedisAndQueue(
 
       for (const campaign of batch) {
         const key = `campaign:${campaign.id}`;
-        pipeline.call('JSON.SET', key, '$', JSON.stringify(toCachedCampaign(campaign)));
+        pipeline.call(
+          'JSON.SET',
+          key,
+          '$',
+          JSON.stringify(toCachedCampaign(campaign))
+        );
         pipeline.expire(key, CAMPAIGN_CACHE_TTL_SECONDS);
         pipeline.sadd('campaign:keys', key);
       }
@@ -844,6 +996,132 @@ async function syncRedisAndQueue(
   } finally {
     await queue.close();
     await redis.quit();
+  }
+}
+
+async function syncSplitRedisAndQueue(
+  campaigns: CampaignEntity[],
+  enqueueEmbeddings: boolean
+): Promise<void> {
+  const configService = new ConfigService(process.env);
+  const searchOptions = resolveRedisConnection(configService, 'SEARCH').options;
+  const budgetOptions = resolveRedisConnection(configService, 'BUDGET').options;
+  const queueOptions = resolveRedisConnection(configService, 'QUEUE').options;
+  const searchRedis = new Redis(searchOptions);
+  const budgetRedis = new Redis(budgetOptions);
+  const embeddingProfile = resolveEmbeddingProfile(
+    process.env.RTB_EMBEDDING_PROFILE
+  );
+  const queue = new Queue(
+    resolveEmbeddingQueueName(
+      process.env.RTB_EMBEDDING_PROFILE,
+      process.env.RTB_EMBEDDING_QUEUE_NAME
+    ),
+    { connection: queueOptions }
+  );
+  const outboxWriter = new CampaignProjectionOutboxWriter();
+  const streamMaxLength = envInt('SEARCH_PROJECTION_STREAM_MAXLEN', 100_000);
+  const budgetDate = new Date(Date.now() + 9 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
+
+  try {
+    let cleanedSearchKeys = 0;
+    for (const pattern of SPLIT_SEARCH_CLEANUP_PATTERNS) {
+      cleanedSearchKeys += await deleteKeysByPattern(searchRedis, pattern);
+    }
+    let cleanedBudgetKeys = 0;
+    for (const pattern of SPLIT_BUDGET_CLEANUP_PATTERNS) {
+      cleanedBudgetKeys += await deleteKeysByPattern(budgetRedis, pattern);
+    }
+
+    for (const campaign of campaigns) {
+      const document = outboxWriter.toDocument(campaign);
+      await budgetRedis.eval(
+        REDIS_APPLY_BUDGET_PROJECTION_SCRIPT,
+        1,
+        `budget:campaign:${campaign.id}`,
+        JSON.stringify({ ...document, budgetDate })
+      );
+      await searchRedis.eval(
+        REDIS_APPLY_SEARCH_PROJECTION_SCRIPT,
+        3,
+        `campaign:${campaign.id}`,
+        `campaign:tombstone:${campaign.id}`,
+        'campaign:keys',
+        JSON.stringify({
+          id: document.id,
+          userId: document.userId,
+          servingVersion: document.servingVersion,
+          semanticHash: document.semanticHash,
+          indexReady: false,
+          title: document.title,
+          content: document.content,
+          image: document.image,
+          url: document.url,
+          maxCpc: document.maxCpc,
+          isHighIntent: document.isHighIntent,
+          status: document.status,
+          startDate: document.startDate,
+          endDate: document.endDate,
+          createdAt: document.createdAt,
+          deletedAt: document.deletedAt,
+          tags: document.tags,
+        }),
+        embeddingProfile.modelVersion
+      );
+      await searchRedis.xadd(
+        'campaign:projection:stream',
+        'MAXLEN',
+        '~',
+        String(streamMaxLength),
+        '*',
+        'type',
+        'UPSERT',
+        'campaignId',
+        campaign.id,
+        'servingVersion',
+        String(campaign.servingVersion),
+        'indexReady',
+        '0'
+      );
+    }
+
+    console.log(
+      `✅ Split Redis projection 동기화 완료: ${campaigns.length}개 (Search 정리 ${cleanedSearchKeys}, Budget 정리 ${cleanedBudgetKeys})`
+    );
+
+    if (enqueueEmbeddings) {
+      await queue.addBulk(
+        campaigns.map((campaign) => {
+          const document = outboxWriter.toDocument(campaign);
+          return {
+            name: 'generate-campaign-embedding',
+            data: {
+              campaignId: campaign.id,
+              servingVersion: Number(campaign.servingVersion),
+              semanticHash: document.semanticHash,
+              modelVersion: embeddingProfile.modelVersion,
+              title: campaign.title,
+              content: campaign.content,
+              tags: document.tags,
+            },
+            opts: {
+              jobId: `campaign-${campaign.id}-v${campaign.servingVersion}-m${toEmbeddingNamespace(
+                embeddingProfile.modelVersion
+              )}`,
+              removeOnComplete: true,
+              removeOnFail: false,
+              attempts: 3,
+            },
+          };
+        })
+      );
+      console.log(`✅ Split embedding 큐 적재 완료: ${campaigns.length}개`);
+    }
+  } finally {
+    await queue.close();
+    await Promise.allSettled([searchRedis.quit(), budgetRedis.quit()]);
   }
 }
 
@@ -893,7 +1171,9 @@ async function reseedCampaigns(): Promise<void> {
       order: { id: 'ASC' },
     });
     const existingUserIds = new Set(existingUsers.map((user) => user.id));
-    const missingUserIds = targetUserIds.filter((userId) => !existingUserIds.has(userId));
+    const missingUserIds = targetUserIds.filter(
+      (userId) => !existingUserIds.has(userId)
+    );
 
     if (missingUserIds.length > 0) {
       throw new Error(`Users not found: ${missingUserIds.join(', ')}`);
@@ -906,6 +1186,7 @@ async function reseedCampaigns(): Promise<void> {
 
     await dataSource.transaction(async (manager) => {
       console.log('🧹 기존 캠페인/로그/태그 정리 중...');
+      await manager.query('DELETE FROM CampaignProjectionOutbox');
       await manager.query('DELETE FROM ClickLog');
       await manager.query('DELETE FROM ViewLog');
       await manager.query('DELETE FROM BidLog');
@@ -932,6 +1213,7 @@ async function reseedCampaigns(): Promise<void> {
         campaignRepo.create({
           id: randomUUID(),
           userId: campaign.userId,
+          servingVersion: 1,
           title: campaign.title,
           content: campaign.content,
           image: campaign.image,
@@ -957,19 +1239,33 @@ async function reseedCampaigns(): Promise<void> {
       );
 
       await campaignRepo.save(campaignEntities, { chunk: 100 });
+      const outboxWriter = new CampaignProjectionOutboxWriter();
+      for (const campaign of campaignEntities) {
+        await outboxWriter.append(
+          manager,
+          campaign,
+          CampaignProjectionEventType.UPSERT
+        );
+      }
       console.log(`✅ DB 캠페인 재생성 완료: ${campaignEntities.length}개`);
     });
 
-    const insertedCampaigns = await dataSource.getRepository(CampaignEntity).find({
-      relations: ['tags'],
-      order: { userId: 'ASC', createdAt: 'ASC' },
-    });
+    const insertedCampaigns = await dataSource
+      .getRepository(CampaignEntity)
+      .find({
+        relations: ['tags'],
+        order: { userId: 'ASC', createdAt: 'ASC' },
+      });
 
     await syncRedisAndQueue(insertedCampaigns, syncRedis, enqueueEmbeddings);
 
     console.log('🎯 reseed 완료');
-    console.log('- backend 프로세스가 이미 떠 있었다면 in-memory allCampaigns cache가 최대 10초간 남을 수 있습니다.');
-    console.log('- worker가 떠 있어야 embeddingTags가 채워지고 RTB match path가 정상 동작합니다.');
+    console.log(
+      '- backend 프로세스가 이미 떠 있었다면 in-memory allCampaigns cache가 최대 10초간 남을 수 있습니다.'
+    );
+    console.log(
+      '- worker가 떠 있어야 embeddingTags가 채워지고 RTB match path가 정상 동작합니다.'
+    );
   } finally {
     await dataSource.destroy();
   }

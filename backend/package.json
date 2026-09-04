@@ -12,6 +12,7 @@
     "start:embedding-worker": "node dist/embedding-worker.main.js",
     "start:reservation-worker": "node dist/reservation-worker.main.js",
     "start:bidlog-worker": "node dist/bidlog-worker.main.js",
+    "start:projection-worker": "node dist/campaign-projection-worker.main.js",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/main",
@@ -23,7 +24,13 @@
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "migrate:earnings": "npm run build && node dist/publisher/scripts/migrate-past-earnings-simple.js",
     "seed:campaigns:realistic": "ts-node -r tsconfig-paths/register src/campaign/scripts/reseed-realistic-campaigns.ts",
-    "docs:typedoc": "typedoc --options typedoc.json"
+    "docs:typedoc": "typedoc --options typedoc.json",
+    "typeorm": "typeorm-ts-node-commonjs -d src/data-source.ts",
+    "migration:run": "npm run typeorm -- migration:run",
+    "migration:revert": "npm run typeorm -- migration:revert",
+    "projection:backfill": "ts-node -r tsconfig-paths/register src/campaign/scripts/backfill-campaign-projection-outbox.ts",
+    "projection:audit": "ts-node -r tsconfig-paths/register src/campaign/scripts/audit-campaign-projection-parity.ts",
+    "redis:roles:smoke": "ts-node -r tsconfig-paths/register src/redis/scripts/verify-redis-role-isolation.ts"
   },
   "dependencies": {
     "@keyv/redis": "^5.1.6",

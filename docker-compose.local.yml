@@ -13,15 +13,57 @@ services:
     networks:
       - boostad-local
 
-  redis:
+  search-redis:
     image: redis/redis-stack-server:latest
-    container_name: boostad-redis-master-local
+    container_name: boostad-search-redis-local
     ports:
       - '16379:6379'
     environment:
-      - REDIS_ARGS=--protected-mode no --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru --save 900 1 --save 300 10 --save 60 10000
+      - REDIS_ARGS=--protected-mode no --maxmemory 2gb --maxmemory-policy volatile-lfu --save 900 1 --save 300 10 --save 60 10000
     volumes:
-      - redis-master-data:/data
+      - search-redis-data:/data
+    restart: unless-stopped
+    networks:
+      - boostad-local
+
+  budget-redis:
+    image: redis:7.4-alpine
+    container_name: boostad-budget-redis-local
+    ports:
+      - '16380:6379'
+    command:
+      - redis-server
+      - --appendonly
+      - 'yes'
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 1gb
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - budget-redis-data:/data
+    restart: unless-stopped
+    networks:
+      - boostad-local
+
+  queue-redis:
+    image: redis:7.4-alpine
+    container_name: boostad-queue-redis-local
+    ports:
+      - '16381:6379'
+    command:
+      - redis-server
+      - --appendonly
+      - 'yes'
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 1gb
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - queue-redis-data:/data
     restart: unless-stopped
     networks:
       - boostad-local
@@ -49,7 +91,9 @@ services:
       - boostad-local
 
 volumes:
-  redis-master-data:
+  search-redis-data:
+  budget-redis-data:
+  queue-redis-data:
   mysql-data:
 
 networks:

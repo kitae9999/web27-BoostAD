@@ -17,8 +17,14 @@ services:
       DB_USERNAME: ${DB_USERNAME:-test_user}
       DB_PASSWORD: ${DB_PASSWORD:-test_user}
       DB_DATABASE: ${DB_DATABASE:-test_db}
-      REDIS_HOST: redis
+      REDIS_HOST: search-redis
       REDIS_PORT: '6379'
+      REDIS_TOPOLOGY_MODE: ${REDIS_TOPOLOGY_MODE:-split}
+      SEARCH_REDIS_URL: ${SEARCH_REDIS_URL:-redis://search-redis:6379}
+      BUDGET_REDIS_URL: ${BUDGET_REDIS_URL:-redis://budget-redis:6379}
+      QUEUE_REDIS_URL: ${QUEUE_REDIS_URL:-redis://queue-redis:6379}
+      CAMPAIGN_PROJECTION_MODE: ${CAMPAIGN_PROJECTION_MODE:-active}
+      SEARCH_PROJECTION_STREAM_MAXLEN: ${SEARCH_PROJECTION_STREAM_MAXLEN:-100000}
       JWT_SECRET: ${JWT_SECRET:-local-dev-jwt-secret}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
@@ -62,7 +68,9 @@ services:
       RTB_CONTEXT_L1_TTL_MS: ${RTB_CONTEXT_L1_TTL_MS:-300000}
     depends_on:
       - mysql
-      - redis
+      - search-redis
+      - budget-redis
+      - queue-redis
     networks:
       - boostad-local
     restart: unless-stopped
