@@ -19,7 +19,7 @@ import { BidLogDataDto, BidLogItemDto } from './dto/bid-log-response.dto';
 import { CampaignRepository } from 'src/campaign/repository/campaign.repository.interface';
 import { BlogRepository } from 'src/blog/repository/blog.repository.interface';
 import { MetricsService } from 'src/metrics/metrics.service';
-import { IOREDIS_CLIENT } from 'src/redis/redis.constant';
+import { QUEUE_REDIS_CLIENT } from 'src/redis/redis.constant';
 import type { AppIORedisClient } from 'src/redis/redis.type';
 import { BID_LOG_CREATED_CHANNEL } from './bid-log.constants';
 
@@ -34,7 +34,7 @@ export class BidLogService implements OnModuleInit, OnModuleDestroy {
     private readonly blogRepository: BlogRepository,
     private readonly eventEmitter: EventEmitter2,
     private readonly metricsService: MetricsService,
-    @Inject(IOREDIS_CLIENT)
+    @Inject(QUEUE_REDIS_CLIENT)
     private readonly ioRedisClient: AppIORedisClient
   ) {}
 

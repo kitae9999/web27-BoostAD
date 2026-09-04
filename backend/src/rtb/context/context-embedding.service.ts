@@ -8,7 +8,7 @@ import {
 import { InjectQueue } from '@nestjs/bullmq';
 import { ConfigService } from '@nestjs/config';
 import { Queue } from 'bullmq';
-import { IOREDIS_CLIENT } from '../../redis/redis.constant';
+import { SEARCH_REDIS_CLIENT } from '../../redis/redis.constant';
 import type { AppIORedisClient } from '../../redis/redis.type';
 import { MetricsService } from '../../metrics/metrics.service';
 import { MLEngine } from '../ml/mlEngine.interface';
@@ -81,7 +81,7 @@ export class ContextEmbeddingService {
     private readonly mlEngine: MLEngine,
     private readonly metricsService: MetricsService,
     private readonly configService: ConfigService,
-    @Inject(IOREDIS_CLIENT) private readonly redis: AppIORedisClient,
+    @Inject(SEARCH_REDIS_CLIENT) private readonly redis: AppIORedisClient,
     @InjectQueue(EMBEDDING_QUEUE_NAME)
     private readonly embeddingQueue: Queue<ContextEmbeddingJobData>
   ) {

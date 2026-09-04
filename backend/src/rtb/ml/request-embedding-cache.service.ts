@@ -1,7 +1,7 @@
 import { createHash } from 'crypto';
 import { Inject, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { IOREDIS_CLIENT } from 'src/redis/redis.constant';
+import { SEARCH_REDIS_CLIENT } from 'src/redis/redis.constant';
 import type { AppIORedisClient } from 'src/redis/redis.type';
 import { MetricsService } from '../../metrics/metrics.service';
 import { MLEngine } from '../ml/mlEngine.interface';
@@ -53,7 +53,7 @@ export class RequestEmbeddingCacheService {
     private readonly mlEngine: MLEngine,
     private readonly metricsService: MetricsService,
     private readonly configService: ConfigService,
-    @Inject(IOREDIS_CLIENT) private readonly redis: AppIORedisClient
+    @Inject(SEARCH_REDIS_CLIENT) private readonly redis: AppIORedisClient
   ) {
     this.l1MaxSize = this.getPositiveInt('RTB_EMBEDDING_L1_MAX_SIZE', 1_000);
     this.l2LookupBudgetMs = this.getPositiveInt(

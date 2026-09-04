@@ -9,7 +9,7 @@ import {
   BidLog,
 } from '../bid-log/bid-log.types';
 import { type AppIORedisClient } from '../redis/redis.type';
-import { IOREDIS_CLIENT } from '../redis/redis.constant';
+import { QUEUE_REDIS_CLIENT } from '../redis/redis.constant';
 import { BID_LOG_CREATED_CHANNEL } from '../bid-log/bid-log.constants';
 import { MetricsService } from '../metrics/metrics.service';
 
@@ -29,7 +29,7 @@ export class SaveBidlogWorker extends WorkerHost {
   constructor(
     private readonly bidLogRepository: BidLogRepository,
     private readonly metricsService: MetricsService,
-    @Inject(IOREDIS_CLIENT)
+    @Inject(QUEUE_REDIS_CLIENT)
     private readonly ioRedisClient: AppIORedisClient
   ) {
     super();

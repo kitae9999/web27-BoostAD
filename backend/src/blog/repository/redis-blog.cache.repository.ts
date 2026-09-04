@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { IOREDIS_CLIENT } from 'src/redis/redis.constant';
+import { SEARCH_REDIS_CLIENT } from 'src/redis/redis.constant';
 import type { AppIORedisClient } from 'src/redis/redis.type';
 import { BlogCacheRepository } from './blog.cache.repository.interface';
 import { CachedBlog } from '../types/blog.type';
@@ -14,7 +14,8 @@ export class BlogRedisCacheRepository implements BlogCacheRepository {
   private readonly BLOG_KEY_INDEX_PREFIX = 'blog:key:'; // blogKey → blogId 매핑
 
   constructor(
-    @Inject(IOREDIS_CLIENT) private readonly ioredisClient: AppIORedisClient
+    @Inject(SEARCH_REDIS_CLIENT)
+    private readonly ioredisClient: AppIORedisClient
   ) {}
 
   async saveBlogCacheById(

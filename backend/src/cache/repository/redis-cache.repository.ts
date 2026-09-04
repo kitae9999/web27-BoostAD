@@ -1,17 +1,27 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { AuctionData } from '../types/auction-data.type';
 import { CacheRepository, RollbackInfo } from './cache.repository.interface';
 import { StoredOAuthState } from '../../auth/auth.service';
 import crypto from 'crypto';
-import { IOREDIS_CLIENT } from 'src/redis/redis.constant';
+import {
+  BUDGET_REDIS_CLIENT,
+  SEARCH_REDIS_CLIENT,
+} from 'src/redis/redis.constant';
 import type { AppIORedisClient } from 'src/redis/redis.type';
 
 @Injectable()
 export class RedisCacheRepository extends CacheRepository {
+  private readonly budgetRedis: AppIORedisClient;
+
   constructor(
-    @Inject(IOREDIS_CLIENT) private readonly redis: AppIORedisClient
+    @Inject(SEARCH_REDIS_CLIENT)
+    private readonly searchRedis: AppIORedisClient,
+    @Optional()
+    @Inject(BUDGET_REDIS_CLIENT)
+    budgetRedis?: AppIORedisClient
   ) {
     super();
+    this.budgetRedis = budgetRedis ?? searchRedis;
   }
 
   private readonly AUCTION_CACHE_TTL = 15 * 60;
@@ -28,19 +38,19 @@ export class RedisCacheRepository extends CacheRepository {
   ): Promise<void> {
     const key = this.getAuctionKey(auctionId);
     const value = JSON.stringify(auctionData);
-    await this.redis.setex(key, ttl, value);
+    await this.budgetRedis.setex(key, ttl, value);
   }
 
   async getAuctionData(auctionId: string): Promise<AuctionData | undefined> {
     const key = this.getAuctionKey(auctionId);
-    const value = await this.redis.get(key);
+    const value = await this.budgetRedis.get(key);
     if (!value) return undefined;
     return JSON.parse(value) as AuctionData;
   }
 
   async deleteAuctionData(auctionId: string): Promise<void> {
     const key = this.getAuctionKey(auctionId);
-    await this.redis.del(key);
+    await this.budgetRedis.del(key);
   }
 
   // OAuth State 관련 메서드
@@ -51,19 +61,19 @@ export class RedisCacheRepository extends CacheRepository {
   ): Promise<void> {
     const key = this.getOAuthStateKey(state);
     const value = JSON.stringify(data);
-    await this.redis.setex(key, ttl, value);
+    await this.searchRedis.setex(key, ttl, value);
   }
 
   async getOAuthState(state: string): Promise<StoredOAuthState | undefined> {
     const key = this.getOAuthStateKey(state);
-    const value = await this.redis.get(key);
+    const value = await this.searchRedis.get(key);
     if (!value) return undefined;
     return JSON.parse(value) as StoredOAuthState;
   }
 
   async deleteOAuthState(state: string): Promise<void> {
     const key = this.getOAuthStateKey(state);
-    await this.redis.del(key);
+    await this.searchRedis.del(key);
   }
 
   async setViewIdempotencyKey(
@@ -76,7 +86,7 @@ export class RedisCacheRepository extends CacheRepository {
     const hashedUrl = this.hashUrl(postUrl);
     const intent = isHighIntent ? 'high' : 'normal';
     const key = `dedup:view:${intent}:post:${hashedUrl}:visitor:${visitorId}`;
-    await this.redis.set(key, String(viewId), 'PX', ttlMs);
+    await this.budgetRedis.set(key, String(viewId), 'PX', ttlMs);
   }
 
   async acquireViewIdempotencyKey(
@@ -94,13 +104,13 @@ export class RedisCacheRepository extends CacheRepository {
     const key = `dedup:view:${intent}:post:${hashedUrl}:visitor:${visitorId}`;
 
     // SET key "LOCK" PX ttlMs NX
-    const result = await this.redis.set(key, 'LOCK', 'PX', ttlMs, 'NX');
+    const result = await this.budgetRedis.set(key, 'LOCK', 'PX', ttlMs, 'NX');
 
     if (result === 'OK') {
       return { status: 'acquired' };
     }
 
-    const existingValue = await this.redis.get(key);
+    const existingValue = await this.budgetRedis.get(key);
     if (!existingValue) return { status: 'locked' };
 
     const existingViewId = Number(existingValue);
@@ -118,7 +128,7 @@ export class RedisCacheRepository extends CacheRepository {
     const intent = isHighIntent ? 'high' : 'normal';
     const key = `dedup:view:${intent}:post:${hashedUrl}:visitor:${visitorId}`;
 
-    const value = await this.redis.get(key);
+    const value = await this.budgetRedis.get(key);
     if (!value) return null;
 
     const viewId = Number(value);
@@ -135,13 +145,13 @@ export class RedisCacheRepository extends CacheRepository {
     const key = `dedup:click:view:${viewId}`;
 
     // SET key "1" PX ttlMs NX
-    const result = await this.redis.set(key, '1', 'PX', ttlMs, 'NX');
+    const result = await this.budgetRedis.set(key, '1', 'PX', ttlMs, 'NX');
 
     if (result === 'OK') {
       return false; // 최초 설정
     }
 
-    const existingValue = await this.redis.get(key);
+    const existingValue = await this.budgetRedis.get(key);
     if (!existingValue) return false;
 
     return true; // 이미 존재
@@ -154,18 +164,18 @@ export class RedisCacheRepository extends CacheRepository {
     ttl: number = this.ROLLBACK_CACHE_TTL // 15분 (초 단위)
   ): Promise<void> {
     const key = `rollback:view:${viewId}`;
-    await this.redis.setex(key, ttl, JSON.stringify(rollbackInfo));
+    await this.budgetRedis.setex(key, ttl, JSON.stringify(rollbackInfo));
   }
 
   async getRollbackInfo(viewId: number): Promise<RollbackInfo | null> {
     const key = `rollback:view:${viewId}`;
-    const data = await this.redis.get(key);
+    const data = await this.budgetRedis.get(key);
     return data ? (JSON.parse(data) as RollbackInfo) : null;
   }
 
   async deleteRollbackInfo(viewId: number): Promise<void> {
     const key = `rollback:view:${viewId}`;
-    await this.redis.del(key);
+    await this.budgetRedis.del(key);
   }
 
   // Rollback 백업 관련 메서드 (TTL 30분 - worker용)
@@ -175,18 +185,18 @@ export class RedisCacheRepository extends CacheRepository {
     ttl: number = this.BACKUP_ROLLBACK_CACHE_TTL
   ): Promise<void> {
     const key = `backup:rollback:view:${viewId}`;
-    await this.redis.setex(key, ttl, JSON.stringify(rollbackInfo));
+    await this.budgetRedis.setex(key, ttl, JSON.stringify(rollbackInfo));
   }
 
   async getRollbackBackup(viewId: number): Promise<RollbackInfo | null> {
     const key = `backup:rollback:view:${viewId}`;
-    const data = await this.redis.get(key);
+    const data = await this.budgetRedis.get(key);
     return data ? (JSON.parse(data) as RollbackInfo) : null;
   }
 
   async deleteRollbackBackup(viewId: number): Promise<void> {
     const key = `backup:rollback:view:${viewId}`;
-    await this.redis.del(key);
+    await this.budgetRedis.del(key);
   }
 
   private getAuctionKey(auctionId: string): string {

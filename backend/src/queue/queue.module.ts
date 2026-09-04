@@ -2,18 +2,17 @@ import { Module } from '@nestjs/common';
 import { BullModule } from '@nestjs/bullmq';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { EMBEDDING_QUEUE_NAME } from './queue.names';
+import { resolveRedisConnection } from '../redis/redis.config';
 
 @Module({
   imports: [
     ConfigModule,
     BullModule.forRootAsync({
       imports: [ConfigModule],
-      useFactory: (configService: ConfigService) => ({
-        connection: {
-          host: configService.get('REDIS_HOST', 'localhost'),
-          port: configService.get('REDIS_PORT', 16379),
-        },
-      }),
+      useFactory: (configService: ConfigService) => {
+        const { options } = resolveRedisConnection(configService, 'QUEUE');
+        return { connection: options };
+      },
       inject: [ConfigService],
     }),
     BullModule.registerQueue(
