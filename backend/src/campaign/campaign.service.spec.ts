@@ -33,7 +33,6 @@ describe('CampaignService initial cache loading', () => {
     job?: object,
     config: {
       profile?: 'legacy_minilm' | 'multilingual_e5_small';
-      denseMode?: 'legacy_tag' | 'semantic_document';
     } = {}
   ) => {
     const campaignRepository = {
@@ -60,9 +59,6 @@ describe('CampaignService initial cache loading', () => {
           if (key === 'RTB_EMBEDDING_PROFILE') {
             return config.profile ?? 'legacy_minilm';
           }
-          if (key === 'RTB_DENSE_RETRIEVAL_MODE') {
-            return config.denseMode ?? 'legacy_tag';
-          }
           return undefined;
         }),
       } as never
@@ -78,7 +74,7 @@ describe('CampaignService initial cache loading', () => {
   it('preserves complete cached embeddings and does not enqueue regeneration', async () => {
     const cached = {
       ...toCachedCampaign(campaign),
-      embeddingTags: { typescript: embedding },
+      embeddingDocument: embedding,
       embeddingModelVersion:
         'Xenova/all-MiniLM-L6-v2@request-v1-mean-normalized',
     };
@@ -90,7 +86,7 @@ describe('CampaignService initial cache loading', () => {
     expect(campaignCacheRepository.saveCampaignCacheById).toHaveBeenCalledWith(
       campaign.id,
       expect.objectContaining({
-        embeddingTags: { typescript: embedding },
+        embeddingDocument: embedding,
       })
     );
     expect(embeddingQueue.getJob).not.toHaveBeenCalled();
@@ -143,21 +139,21 @@ describe('CampaignService initial cache loading', () => {
   it('does not reuse same-dimension embeddings from a different model', async () => {
     const cached = {
       ...toCachedCampaign(campaign),
-      embeddingTags: { typescript: embedding },
+      embeddingDocument: embedding,
       embeddingModelVersion:
         'Xenova/all-MiniLM-L6-v2@request-v1-mean-normalized',
     };
     const { service, campaignCacheRepository, embeddingQueue } = buildService(
       cached,
       undefined,
-      { profile: 'multilingual_e5_small', denseMode: 'semantic_document' }
+      { profile: 'multilingual_e5_small' }
     );
 
     await service.loadAllCampaigns();
 
     expect(campaignCacheRepository.saveCampaignCacheById).toHaveBeenCalledWith(
       campaign.id,
-      expect.not.objectContaining({ embeddingTags: expect.anything() })
+      expect.not.objectContaining({ embeddingDocument: expect.anything() })
     );
     expect(embeddingQueue.add).toHaveBeenCalledWith(
       'generate-campaign-embedding',

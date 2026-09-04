@@ -51,7 +51,6 @@ type CampaignProjectionMode = 'off' | 'shadow' | 'active';
 export class CampaignService {
   private readonly logger = new Logger(CampaignService.name);
   private readonly embeddingProfile: EmbeddingProfile;
-  private readonly requireDocumentEmbedding: boolean;
   private readonly projectionMode: CampaignProjectionMode;
   private readonly outboxWriter: CampaignProjectionOutboxWriter;
 
@@ -70,11 +69,6 @@ export class CampaignService {
     this.embeddingProfile = resolveEmbeddingProfile(
       configService.get<string>('RTB_EMBEDDING_PROFILE')
     );
-    this.requireDocumentEmbedding =
-      configService.get<string>(
-        'RTB_DENSE_RETRIEVAL_MODE',
-        'semantic_document'
-      ) === 'semantic_document';
     const configuredMode = configService.get<string>(
       'CAMPAIGN_PROJECTION_MODE',
       'off'
@@ -155,58 +149,31 @@ export class CampaignService {
     campaign: CachedCampaign,
     cached: CachedCampaign | null
   ): CachedCampaign {
-    if (!campaign.tags || !cached?.embeddingTags) {
+    if (!cached?.embeddingDocument) {
       return campaign;
     }
 
     const sameModel =
-      cached.embeddingModelVersion === this.embeddingProfile.modelVersion ||
-      (this.embeddingProfile.name === 'legacy_minilm' &&
-        !cached.embeddingModelVersion);
-    if (!sameModel) {
-      return campaign;
-    }
-
-    const reusableEmbeddingTags = Object.fromEntries(
-      campaign.tags
-        .filter(
-          (tagName) =>
-            cached.embeddingTags?.[tagName]?.length ===
-            this.embeddingProfile.dimension
-        )
-        .map((tagName) => [tagName, cached.embeddingTags![tagName]])
-    );
-
-    if (Object.keys(reusableEmbeddingTags).length === 0) {
+      cached.embeddingModelVersion === this.embeddingProfile.modelVersion;
+    const hasDocument =
+      cached.embeddingDocument.length === this.embeddingProfile.dimension;
+    if (!sameModel || !hasDocument) {
       return campaign;
     }
 
     return {
       ...campaign,
-      embeddingTags: reusableEmbeddingTags,
       embeddingModelVersion: this.embeddingProfile.modelVersion,
-      ...(cached.embeddingDocument?.length === this.embeddingProfile.dimension
-        ? { embeddingDocument: cached.embeddingDocument }
-        : {}),
+      embeddingDocument: cached.embeddingDocument,
     };
   }
 
   private hasRequiredEmbeddings(campaign: CachedCampaign): boolean {
-    const hasTags = Boolean(
-      campaign.tags?.length &&
-      campaign.tags.every(
-        (tagName) =>
-          campaign.embeddingTags?.[tagName]?.length ===
-          this.embeddingProfile.dimension
-      )
-    );
     const sameModel =
       campaign.embeddingModelVersion === this.embeddingProfile.modelVersion;
     const hasDocument =
       campaign.embeddingDocument?.length === this.embeddingProfile.dimension;
-    return Boolean(
-      hasTags && sameModel && (!this.requireDocumentEmbedding || hasDocument)
-    );
+    return Boolean(sameModel && hasDocument);
   }
 
   private async enqueueInitialCampaignEmbedding(
@@ -759,7 +726,7 @@ export class CampaignService {
       // 태그 이름 배열 추가
       tags: campaign.tags.map((t) => t.name),
 
-      // embeddingTags는 Worker가 나중에 추가
+      // embeddingDocument는 Worker가 나중에 추가
     };
   }
 

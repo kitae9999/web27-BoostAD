@@ -12,11 +12,7 @@ import { ContextEmbeddingService } from '../context/context-embedding.service';
 describe('TransformerMatcher ANN path', () => {
   const now = new Date('2026-03-29T00:00:00.000Z');
 
-  const buildCampaign = (
-    id: string,
-    tags: string[],
-    embeddingTags: Record<string, number[]>
-  ): CachedCampaign => ({
+  const buildCampaign = (id: string, tags: string[]): CachedCampaign => ({
     id,
     userId: 1,
     servingVersion: 1,
@@ -37,7 +33,9 @@ describe('TransformerMatcher ANN path', () => {
     createdAt: now.toISOString(),
     deletedAt: null,
     tags,
-    embeddingTags,
+    indexReady: true,
+    embeddingModelVersion: 'Xenova/all-MiniLM-L6-v2',
+    embeddingDocument: [1, 0],
   });
 
   const buildMetricsService = () =>
@@ -45,7 +43,6 @@ describe('TransformerMatcher ANN path', () => {
       incRtbFallback: jest.fn(),
       recordRtbStage: jest.fn(),
       observeRtbEligibleCampaignCount: jest.fn(),
-      observeRtbAnnTagHitCount: jest.fn(),
       observeRtbAnnRetrievedCampaignCount: jest.fn(),
       incRtbEmbeddingL1Hit: jest.fn(),
       incRtbEmbeddingL1Miss: jest.fn(),
@@ -70,9 +67,6 @@ describe('TransformerMatcher ANN path', () => {
       get: jest.fn((key: string, defaultValue?: string) => {
         if (overrides && key in overrides) {
           return overrides[key];
-        }
-        if (key === 'RTB_DENSE_RETRIEVAL_MODE') {
-          return 'legacy_tag';
         }
         return defaultValue;
       }),
@@ -150,17 +144,23 @@ describe('TransformerMatcher ANN path', () => {
       incrementSpent: jest.fn(),
       decrementSpent: jest.fn(),
       deleteCampaignEmbeddingById: jest.fn(),
-      updateCampaignEmbeddingTags: jest.fn(),
       updateCampaignEmbeddings: jest.fn(),
       deleteCampaignCacheById: jest.fn(),
       existsCampaignCacheById: jest.fn(),
       getAllCampaigns: jest.fn(),
       resetDailySpentCache: jest.fn(),
-      searchCampaignTagVectors: jest.fn(),
-      searchCampaignDocumentVectors: jest.fn(),
+      searchCampaignDocumentVectors: jest.fn(() =>
+        Promise.resolve(
+          campaigns.map((campaign) => ({
+            campaignId: campaign.id,
+            servingVersion: campaign.servingVersion,
+            distance: 0,
+            similarity: 1,
+          }))
+        )
+      ),
     }) as unknown as CampaignCacheRepository & {
       getAllCampaigns: jest.Mock;
-      searchCampaignTagVectors: jest.Mock;
       searchCampaignDocumentVectors: jest.Mock;
       findCampaignCachesByIds: jest.Mock;
     };
@@ -198,25 +198,18 @@ describe('TransformerMatcher ANN path', () => {
     jest.useRealTimers();
   });
 
-  it('uses ANN retrieval and skips full campaign scan when enabled', async () => {
-    const campaign1 = buildCampaign('c1', ['typescript', 'nestjs'], {
-      typescript: [1, 0],
-      nestjs: [0.9, 0.1],
-    });
-    const campaign2 = buildCampaign('c2', ['react'], {
-      react: [0.8, 0.2],
-    });
+  it('uses ANN retrieval and skips full campaign scan', async () => {
+    const campaign1 = buildCampaign('c1', ['typescript', 'nestjs']);
+    const campaign2 = buildCampaign('c2', ['react']);
 
     const repository = buildRepository([campaign1, campaign2]);
-    repository.searchCampaignTagVectors.mockResolvedValue([
+    repository.searchCampaignDocumentVectors.mockResolvedValue([
       {
         campaignId: 'c1',
-        tagName: 'typescript',
         distance: 0.02,
         similarity: 0.98,
       },
-      { campaignId: 'c1', tagName: 'nestjs', distance: 0.06, similarity: 0.94 },
-      { campaignId: 'c2', tagName: 'react', distance: 0.1, similarity: 0.9 },
+      { campaignId: 'c2', distance: 0.1, similarity: 0.9 },
     ]);
 
     const matcher = buildMatcher(
@@ -225,10 +218,8 @@ describe('TransformerMatcher ANN path', () => {
       buildMlEngine(),
       buildMetricsService(),
       buildConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'true',
         RTB_MATCHER_ANN_TOP_L: '10',
         RTB_MATCHER_ANN_TOP_M: '2',
-        RTB_MATCHER_ANN_PER_CAMPAIGN_HIT_LIMIT: '2',
       })
     );
 
@@ -242,7 +233,7 @@ describe('TransformerMatcher ANN path', () => {
       isHighIntent: false,
     });
 
-    expect(repository.searchCampaignTagVectors).toHaveBeenCalledTimes(1);
+    expect(repository.searchCampaignDocumentVectors).toHaveBeenCalledTimes(1);
     expect(repository.findCampaignCachesByIds).toHaveBeenCalledWith([
       'c1',
       'c2',
@@ -255,7 +246,7 @@ describe('TransformerMatcher ANN path', () => {
 
   it('falls back when ANN returns no hits', async () => {
     const repository = buildRepository([]);
-    repository.searchCampaignTagVectors.mockResolvedValue([]);
+    repository.searchCampaignDocumentVectors.mockResolvedValue([]);
     const metrics = buildMetricsService();
 
     const matcher = buildMatcher(
@@ -263,9 +254,7 @@ describe('TransformerMatcher ANN path', () => {
       buildSnapshot([]),
       buildMlEngine(),
       metrics,
-      buildConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'true',
-      })
+      buildConfigService()
     );
 
     const candidates = await matcher.matchCandidates({
@@ -288,11 +277,11 @@ describe('TransformerMatcher ANN path', () => {
 
   it('uses campaign document ANN by default without tag-vector rerank', async () => {
     const campaign1 = {
-      ...buildCampaign('c1', ['typescript'], { typescript: [1, 0] }),
+      ...buildCampaign('c1', ['typescript']),
       embeddingDocument: [0.4, 0.6],
     };
     const campaign2 = {
-      ...buildCampaign('c2', ['react'], { react: [0.8, 0.2] }),
+      ...buildCampaign('c2', ['react']),
       embeddingDocument: [0.9, 0.1],
     };
     const repository = buildRepository([campaign1, campaign2]);
@@ -308,7 +297,6 @@ describe('TransformerMatcher ANN path', () => {
       buildMlEngine(),
       buildMetricsService(),
       buildProductDefaultConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'true',
         RTB_CAMPAIGN_SOURCE: 'local_snapshot',
         RTB_MATCHER_DOCUMENT_SIMILARITY_THRESHOLD: '0.3',
         RTB_MATCHER_ANN_TOP_M: '10',
@@ -326,7 +314,6 @@ describe('TransformerMatcher ANN path', () => {
     });
 
     expect(repository.searchCampaignDocumentVectors).toHaveBeenCalledTimes(1);
-    expect(repository.searchCampaignTagVectors).not.toHaveBeenCalled();
     expect(candidates.map((candidate) => candidate.id)).toEqual(['c2', 'c1']);
     expect(candidates.map((candidate) => candidate.similarity)).toEqual([
       0.9, 0.4,
@@ -335,7 +322,7 @@ describe('TransformerMatcher ANN path', () => {
 
   it('rejects an ANN hit whose campaign version differs from hydration', async () => {
     const current = {
-      ...buildCampaign('c1', ['typescript'], { typescript: [1, 0] }),
+      ...buildCampaign('c1', ['typescript']),
       servingVersion: 2,
       indexReady: true,
       embeddingDocument: [0.4, 0.6],
@@ -355,7 +342,6 @@ describe('TransformerMatcher ANN path', () => {
       buildMlEngine(),
       buildMetricsService(),
       buildProductDefaultConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'true',
         RTB_CAMPAIGN_SOURCE: 'local_snapshot',
       })
     );
@@ -375,11 +361,11 @@ describe('TransformerMatcher ANN path', () => {
 
   it('returns the real hybrid reserve candidates when RTB_RETRIEVAL_MODE=hybrid', async () => {
     const denseOnly = {
-      ...buildCampaign('dense-1', ['typescript'], { typescript: [1, 0] }),
+      ...buildCampaign('dense-1', ['typescript']),
       embeddingDocument: [0.9, 0.1],
     };
     const sparseOnly = {
-      ...buildCampaign('sparse-1', ['typescript'], { typescript: [0.5, 0.5] }),
+      ...buildCampaign('sparse-1', ['typescript']),
       embeddingDocument: [0.8, 0.2],
       maxCpc: 200,
     };
@@ -393,7 +379,6 @@ describe('TransformerMatcher ANN path', () => {
       buildMlEngine(),
       buildMetricsService(),
       buildProductDefaultConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'true',
         RTB_CAMPAIGN_SOURCE: 'local_snapshot',
         RTB_MATCHER_DOCUMENT_SIMILARITY_THRESHOLD: '0.3',
         RTB_RETRIEVAL_MODE: 'hybrid',
@@ -421,13 +406,11 @@ describe('TransformerMatcher ANN path', () => {
 
   it('returns Hybrid rankings from findQualityRankings(hybrid)', async () => {
     const denseOnly = {
-      ...buildCampaign('dense-1', ['react'], { react: [1, 0] }),
+      ...buildCampaign('dense-1', ['react']),
       embeddingDocument: [0.9, 0.1],
     };
     const sparseOnly = {
-      ...buildCampaign('sparse-1', ['typescript'], {
-        typescript: [0.5, 0.5],
-      }),
+      ...buildCampaign('sparse-1', ['typescript']),
       embeddingDocument: [0.8, 0.2],
       maxCpc: 200,
     };
@@ -441,7 +424,6 @@ describe('TransformerMatcher ANN path', () => {
       buildMlEngine(),
       buildMetricsService(),
       buildProductDefaultConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'true',
         RTB_CAMPAIGN_SOURCE: 'local_snapshot',
         RTB_MATCHER_DOCUMENT_SIMILARITY_THRESHOLD: '0.3',
         RTB_RETRIEVAL_MODE: 'dense_only',
@@ -472,17 +454,17 @@ describe('TransformerMatcher ANN path', () => {
 
   it('exact-reranks the hybrid pool below the locked dense winner', async () => {
     const denseFirstByAnn = {
-      ...buildCampaign('dense-ann-1', ['react'], { react: [1, 0] }),
+      ...buildCampaign('dense-ann-1', ['react']),
       embeddingDocument: [0.6, 0.4],
       maxCpc: 100,
     };
     const denseBestByExact = {
-      ...buildCampaign('dense-exact-1', ['node'], { node: [1, 0] }),
+      ...buildCampaign('dense-exact-1', ['node']),
       embeddingDocument: [0.9, 0.1],
       maxCpc: 100,
     };
     const sparseOnly = {
-      ...buildCampaign('sparse-1', ['typescript'], { typescript: [1, 0] }),
+      ...buildCampaign('sparse-1', ['typescript']),
       embeddingDocument: [1, 0],
       maxCpc: 500,
     };
@@ -498,7 +480,6 @@ describe('TransformerMatcher ANN path', () => {
       buildMlEngine(),
       buildMetricsService(),
       buildProductDefaultConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'true',
         RTB_CAMPAIGN_SOURCE: 'local_snapshot',
         RTB_MATCHER_DOCUMENT_SIMILARITY_THRESHOLD: '0.3',
         RTB_HYBRID_SPARSE_WEIGHT: '0.2',
@@ -532,7 +513,7 @@ describe('TransformerMatcher ANN path', () => {
 
   it('does not run Hybrid retrieval when RTB_RETRIEVAL_MODE=dense_only', async () => {
     const campaign1 = {
-      ...buildCampaign('c1', ['typescript'], { typescript: [1, 0] }),
+      ...buildCampaign('c1', ['typescript']),
       embeddingDocument: [0.4, 0.6],
     };
     const repository = buildRepository([campaign1]);
@@ -546,7 +527,6 @@ describe('TransformerMatcher ANN path', () => {
       buildMlEngine(),
       buildMetricsService(),
       buildProductDefaultConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'true',
         RTB_CAMPAIGN_SOURCE: 'local_snapshot',
         RTB_RETRIEVAL_MODE: 'dense_only',
       })
@@ -567,9 +547,7 @@ describe('TransformerMatcher ANN path', () => {
   });
 
   it('returns no semantic candidates when every document is below threshold', async () => {
-    const campaign = buildCampaign('c1', ['typescript'], {
-      typescript: [1, 0],
-    });
+    const campaign = buildCampaign('c1', ['typescript']);
     const repository = buildRepository([campaign]);
     repository.searchCampaignDocumentVectors.mockResolvedValue([
       { campaignId: 'c1', distance: 0.75, similarity: 0.25 },
@@ -581,8 +559,6 @@ describe('TransformerMatcher ANN path', () => {
       buildMlEngine(),
       metrics,
       buildConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'true',
-        RTB_DENSE_RETRIEVAL_MODE: 'semantic_document',
         RTB_MATCHER_DOCUMENT_SIMILARITY_THRESHOLD: '0.3',
       })
     );
@@ -605,9 +581,7 @@ describe('TransformerMatcher ANN path', () => {
   });
 
   it('uses bounded lexical fallback while the semantic index is empty', async () => {
-    const campaign = buildCampaign('c1', ['typescript'], {
-      typescript: [1, 0],
-    });
+    const campaign = buildCampaign('c1', ['typescript']);
     const repository = buildRepository([campaign]);
     repository.searchCampaignDocumentVectors.mockResolvedValue([]);
     const metrics = buildMetricsService();
@@ -617,9 +591,7 @@ describe('TransformerMatcher ANN path', () => {
       buildMlEngine(),
       metrics,
       buildConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'true',
         RTB_CAMPAIGN_SOURCE: 'local_snapshot',
-        RTB_DENSE_RETRIEVAL_MODE: 'semantic_document',
       })
     );
 
@@ -721,14 +693,14 @@ describe('TransformerMatcher ANN path', () => {
 
   it('3B-M1: cold embedding miss returns ranked lexical candidates immediately', async () => {
     const exact = {
-      ...buildCampaign('c1', ['react', 'typescript'], {}),
+      ...buildCampaign('c1', ['react', 'typescript']),
       maxCpc: 100,
     };
     const partial = {
-      ...buildCampaign('c2', ['react'], {}),
+      ...buildCampaign('c2', ['react']),
       maxCpc: 500,
     };
-    const unrelated = buildCampaign('c3', ['redis'], {});
+    const unrelated = buildCampaign('c3', ['redis']);
     const campaigns = [exact, partial, unrelated];
     const repository = buildRepository(campaigns);
     const snapshot = buildSnapshot(campaigns);
@@ -742,7 +714,6 @@ describe('TransformerMatcher ANN path', () => {
       mlEngine as unknown as MLEngine,
       metrics,
       buildConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'true',
         RTB_CAMPAIGN_SOURCE: 'local_snapshot',
         RTB_EMBEDDING_COLD_MISS_FAST_PATH_ENABLED: 'true',
       })
@@ -759,7 +730,7 @@ describe('TransformerMatcher ANN path', () => {
     });
 
     expect(candidates.map((candidate) => candidate.id)).toEqual(['c1', 'c2']);
-    expect(repository.searchCampaignTagVectors).not.toHaveBeenCalled();
+    expect(repository.searchCampaignDocumentVectors).not.toHaveBeenCalled();
     expect(snapshot.findCampaignsByTags).toHaveBeenCalledWith([
       'typescript',
       'react',
@@ -777,7 +748,7 @@ describe('TransformerMatcher ANN path', () => {
   });
 
   it('3B-M2: model-not-ready still serves lexical candidates without runtime', async () => {
-    const campaign = buildCampaign('c1', ['react'], {});
+    const campaign = buildCampaign('c1', ['react']);
     const repository = buildRepository([campaign]);
     const snapshot = buildSnapshot([campaign]);
     const mlEngine = buildMlEngine() as unknown as {
@@ -819,12 +790,11 @@ describe('TransformerMatcher ANN path', () => {
   });
 
   it('3D-M1: READY context embedding becomes the ANN query vector', async () => {
-    const campaign = buildCampaign('c1', ['react'], { react: [0, 1] });
+    const campaign = buildCampaign('c1', ['react']);
     const repository = buildRepository([campaign]);
-    repository.searchCampaignTagVectors.mockResolvedValue([
+    repository.searchCampaignDocumentVectors.mockResolvedValue([
       {
         campaignId: 'c1',
-        tagName: 'react',
         distance: 0.01,
         similarity: 0.99,
       },
@@ -844,7 +814,6 @@ describe('TransformerMatcher ANN path', () => {
       mlEngine as unknown as MLEngine,
       metrics,
       buildConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'true',
         RTB_CAMPAIGN_SOURCE: 'local_snapshot',
         RTB_CONTEXT_DECISION_ENABLED: 'true',
       }),
@@ -863,7 +832,7 @@ describe('TransformerMatcher ANN path', () => {
     });
 
     expect(candidates.map((candidate) => candidate.id)).toEqual(['c1']);
-    expect(repository.searchCampaignTagVectors).toHaveBeenCalledWith(
+    expect(repository.searchCampaignDocumentVectors).toHaveBeenCalledWith(
       expect.objectContaining({ queryEmbedding: [0, 1] })
     );
     expect(mlEngine.getEmbedding).not.toHaveBeenCalled();
@@ -876,7 +845,7 @@ describe('TransformerMatcher ANN path', () => {
   });
 
   it('3D-M2: PENDING context falls back to lexical candidates', async () => {
-    const campaign = buildCampaign('c1', ['react'], {});
+    const campaign = buildCampaign('c1', ['react']);
     const repository = buildRepository([campaign]);
     const metrics = buildMetricsService();
     const contextEmbeddingService = {
@@ -891,7 +860,6 @@ describe('TransformerMatcher ANN path', () => {
       mlEngine as unknown as MLEngine,
       metrics,
       buildConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'true',
         RTB_CAMPAIGN_SOURCE: 'local_snapshot',
         RTB_EMBEDDING_COLD_MISS_FAST_PATH_ENABLED: 'true',
         RTB_CONTEXT_DECISION_ENABLED: 'true',
@@ -911,7 +879,7 @@ describe('TransformerMatcher ANN path', () => {
     });
 
     expect(candidates.map((candidate) => candidate.id)).toEqual(['c1']);
-    expect(repository.searchCampaignTagVectors).not.toHaveBeenCalled();
+    expect(repository.searchCampaignDocumentVectors).not.toHaveBeenCalled();
     expect(mlEngine.getEmbedding).not.toHaveBeenCalled();
     const metricsMock = metrics as unknown as {
       recordRtbContextDecision: jest.Mock;
@@ -929,15 +897,15 @@ describe('TransformerMatcher ANN path', () => {
   it('3B-M3: lexical rank prefers more exact matches then higher CPC on ties', async () => {
     // coverage = exact/requestSize 이므로 exact가 같으면 coverage도 같다 → CPC tie-break
     const twoExact = {
-      ...buildCampaign('c-exact2', ['react', 'nestjs'], {}),
+      ...buildCampaign('c-exact2', ['react', 'nestjs']),
       maxCpc: 10,
     };
     const oneExactLowCpc = {
-      ...buildCampaign('c-low', ['react'], {}),
+      ...buildCampaign('c-low', ['react']),
       maxCpc: 10,
     };
     const oneExactHighCpc = {
-      ...buildCampaign('c-high', ['react', 'redis'], {}),
+      ...buildCampaign('c-high', ['react', 'redis']),
       maxCpc: 999,
     };
     const campaigns = [oneExactLowCpc, oneExactHighCpc, twoExact];
@@ -969,9 +937,8 @@ describe('TransformerMatcher ANN path', () => {
     ]);
   });
 
-  it('3B-M4: campaigns without embeddingTags remain lexical candidates', async () => {
-    const campaign = buildCampaign('c1', ['react'], {});
-    delete (campaign as { embeddingTags?: unknown }).embeddingTags;
+  it('3B-M4: campaigns remain lexical candidates on embedding cold miss', async () => {
+    const campaign = buildCampaign('c1', ['react']);
     const matcher = buildMatcher(
       buildRepository([campaign]),
       buildSnapshot([campaign]),
@@ -996,7 +963,7 @@ describe('TransformerMatcher ANN path', () => {
   });
 
   it('3B-M5: no tag overlap yields empty matcher candidates', async () => {
-    const campaign = buildCampaign('c1', ['redis'], {});
+    const campaign = buildCampaign('c1', ['redis']);
     const metrics = buildMetricsService();
     const matcher = buildMatcher(
       buildRepository([campaign]),
@@ -1037,7 +1004,6 @@ describe('TransformerMatcher ANN path', () => {
       mlEngine as unknown as MLEngine,
       metrics,
       buildConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'false',
         RTB_EMBEDDING_COLD_MISS_FAST_PATH_ENABLED: 'false',
       })
     );
@@ -1056,7 +1022,7 @@ describe('TransformerMatcher ANN path', () => {
     expect(
       (metrics as unknown as { recordRtbLexicalFallback: jest.Mock })
         .recordRtbLexicalFallback
-    ).not.toHaveBeenCalled();
+    ).toHaveBeenCalledWith('semantic_index_unready', 0);
     expect(
       (metrics as unknown as { incRtbEmbeddingSource: jest.Mock })
         .incRtbEmbeddingSource
@@ -1064,7 +1030,7 @@ describe('TransformerMatcher ANN path', () => {
   });
 
   it('3D-M3: FAILED and TIMEOUT context fall back to lexical', async () => {
-    const campaign = buildCampaign('c1', ['react'], {});
+    const campaign = buildCampaign('c1', ['react']);
     for (const status of ['FAILED', 'TIMEOUT'] as const) {
       const metrics = buildMetricsService();
       const mlEngine = buildMlEngine() as unknown as {
@@ -1104,14 +1070,11 @@ describe('TransformerMatcher ANN path', () => {
   });
 
   it('hydrates ANN candidates from the local snapshot when enabled', async () => {
-    const campaign = buildCampaign('c1', ['typescript'], {
-      typescript: [1, 0],
-    });
+    const campaign = buildCampaign('c1', ['typescript']);
     const repository = buildRepository([campaign]);
-    repository.searchCampaignTagVectors.mockResolvedValue([
+    repository.searchCampaignDocumentVectors.mockResolvedValue([
       {
         campaignId: 'c1',
-        tagName: 'typescript',
         distance: 0.02,
         similarity: 0.98,
       },
@@ -1125,7 +1088,6 @@ describe('TransformerMatcher ANN path', () => {
       buildMlEngine(),
       metrics,
       buildConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'true',
         RTB_CAMPAIGN_SOURCE: 'local_snapshot',
       })
     );
@@ -1153,11 +1115,9 @@ describe('TransformerMatcher ANN path', () => {
   });
 
   it('falls back to the local lexical snapshot when Search Redis ANN fails', async () => {
-    const campaign = buildCampaign('c1', ['typescript'], {
-      typescript: [1, 0],
-    });
+    const campaign = buildCampaign('c1', ['typescript']);
     const repository = buildRepository([campaign]);
-    repository.searchCampaignTagVectors.mockRejectedValue(
+    repository.searchCampaignDocumentVectors.mockRejectedValue(
       new Error('search unavailable')
     );
     const metrics = buildMetricsService();
@@ -1167,7 +1127,6 @@ describe('TransformerMatcher ANN path', () => {
       buildMlEngine(),
       metrics,
       buildConfigService({
-        RTB_MATCHER_ANN_ENABLED: 'true',
         RTB_CAMPAIGN_SOURCE: 'local_snapshot',
       })
     );
@@ -1191,24 +1150,18 @@ describe('TransformerMatcher ANN path', () => {
   });
 
   it('keeps candidate ranking identical between Redis and snapshot hydration', async () => {
-    const first = buildCampaign('c1', ['typescript'], {
-      typescript: [1, 0],
-    });
-    const second = buildCampaign('c2', ['react'], {
-      react: [0.8, 0.2],
-    });
+    const first = buildCampaign('c1', ['typescript']);
+    const second = buildCampaign('c2', ['react']);
     const campaigns = [first, second];
     const repository = buildRepository(campaigns);
-    repository.searchCampaignTagVectors.mockResolvedValue([
+    repository.searchCampaignDocumentVectors.mockResolvedValue([
       {
         campaignId: 'c1',
-        tagName: 'typescript',
         distance: 0.02,
         similarity: 0.98,
       },
       {
         campaignId: 'c2',
-        tagName: 'react',
         distance: 0.1,
         similarity: 0.9,
       },
@@ -1229,7 +1182,6 @@ describe('TransformerMatcher ANN path', () => {
         buildMlEngine(),
         buildMetricsService(),
         buildConfigService({
-          RTB_MATCHER_ANN_ENABLED: 'true',
           RTB_CAMPAIGN_SOURCE: campaignSource,
         })
       );

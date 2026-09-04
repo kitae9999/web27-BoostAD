@@ -16,9 +16,8 @@ import {
   CachedCampaign,
   CachedCampaignWithoutSpent,
   CampaignDocumentVectorSearchHit,
+  CampaignDocumentVectorSearchOptions,
   CampaignEmbeddingPayload,
-  CampaignTagVectorSearchHit,
-  CampaignTagVectorSearchOptions,
   ReserveAuctionRequest,
   ReserveAuctionResult,
   SearchCampaign,
@@ -96,9 +95,6 @@ export class RedisCampaignCacheRepository
   private readonly SEARCH_SNAPSHOT_STREAM = 'campaign:projection:stream';
   private readonly embeddingProfile: EmbeddingProfile;
   private readonly embeddingNamespace: string;
-  private readonly campaignTagVectorPrefix: string;
-  private readonly campaignTagVectorIndex: string;
-  private readonly campaignTagVectorKeysPrefix: string;
   private readonly campaignDocumentVectorPrefix: string;
   private readonly campaignDocumentVectorIndex: string;
   private readonly CAMPAIGN_CACHE_TTL = 60 * 60 * 24;
@@ -121,7 +117,6 @@ export class RedisCampaignCacheRepository
   } | null = null;
 
   private allCampaignsInFlight: Promise<CachedCampaign[]> | null = null;
-  private campaignTagVectorIndexReady: Promise<void> | null = null;
   private campaignDocumentVectorIndexReady: Promise<void> | null = null;
 
   constructor(
@@ -145,22 +140,6 @@ export class RedisCampaignCacheRepository
       'split';
     // split 환경은 servingVersion 필드가 포함된 새 인덱스 namespace를 쓴다.
     // legacy endpoint의 기존 인덱스를 변경하지 않아 즉시 rollback할 수 있다.
-    const legacy = this.embeddingProfile.name === 'legacy_minilm';
-    this.campaignTagVectorPrefix = this.splitTopology
-      ? `campaign-tag-vec:projection-v2:${this.embeddingNamespace}:`
-      : legacy
-        ? 'campaign-tag-vec:'
-        : `campaign-tag-vec:${this.embeddingNamespace}:`;
-    this.campaignTagVectorIndex = this.splitTopology
-      ? `idx:campaign_tag_vec:projection-v2:${this.embeddingNamespace}`
-      : legacy
-        ? 'idx:campaign_tag_vec'
-        : `idx:campaign_tag_vec:${this.embeddingNamespace}`;
-    this.campaignTagVectorKeysPrefix = this.splitTopology
-      ? `campaign-tag-vec-keys:projection-v2:${this.embeddingNamespace}:`
-      : legacy
-        ? 'campaign-tag-vec-keys:'
-        : `campaign-tag-vec-keys:${this.embeddingNamespace}:`;
     this.campaignDocumentVectorPrefix = this.splitTopology
       ? `campaign-doc-vec:projection-v2:${this.embeddingNamespace}:`
       : `campaign-doc-vec:${this.embeddingNamespace}:`;
@@ -407,7 +386,6 @@ export class RedisCampaignCacheRepository
         `Search projection 적용 후 캠페인을 찾을 수 없습니다: ${campaign.id}`
       );
     }
-    await this.syncCampaignTagVectorDocs(current);
     await this.syncCampaignDocumentVectorDoc(current);
     this.publishUpsert(current);
     await this.appendSnapshotEvent({
@@ -434,10 +412,7 @@ export class RedisCampaignCacheRepository
       )
     );
     if (result < 0) return false;
-    await Promise.all([
-      this.deleteCampaignTagVectorDocs(campaignId),
-      this.deleteCampaignDocumentVectorDoc(campaignId),
-    ]);
+    await this.deleteCampaignDocumentVectorDoc(campaignId);
     this.allCampaignsCache = null;
     this.eventEmitter.emit(CAMPAIGN_CACHE_REMOVED_EVENT, {
       campaignId,
@@ -502,7 +477,6 @@ export class RedisCampaignCacheRepository
     if (!current) {
       throw new Error(`Embedding 적용 후 캠페인을 찾을 수 없습니다: ${id}`);
     }
-    await this.syncCampaignTagVectorDocs(current);
     await this.syncCampaignDocumentVectorDoc(current);
     this.publishUpsert(current);
     await this.appendSnapshotEvent({
@@ -552,18 +526,13 @@ export class RedisCampaignCacheRepository
         await this.applyBudgetProjection(projection);
         await this.applySearchProjection(projection);
 
-        if (
-          normalized.embeddingModelVersion &&
-          normalized.embeddingTags &&
-          normalized.embeddingDocument
-        ) {
+        if (normalized.embeddingModelVersion && normalized.embeddingDocument) {
           await this.updateEmbeddingsIfCurrent(
             id,
             normalized.servingVersion,
             projection.semanticHash,
             {
               modelVersion: normalized.embeddingModelVersion,
-              tags: normalized.embeddingTags,
               document: normalized.embeddingDocument,
             }
           );
@@ -592,7 +561,6 @@ export class RedisCampaignCacheRepository
         this.ioredisClient.sadd(this.CAMPAIGN_KEYS_SET, key),
       ]);
       await this.applyBudgetProjection(this.toProjectionDocument(normalized));
-      await this.syncCampaignTagVectorDocs(normalized);
       await this.syncCampaignDocumentVectorDoc(normalized);
       this.publishUpsert(normalized);
     } catch (error) {
@@ -686,7 +654,6 @@ export class RedisCampaignCacheRepository
         await this.applyBudgetProjection(
           this.toProjectionDocument(updatedCampaign)
         );
-        await this.syncCampaignTagVectorDocs(updatedCampaign);
         await this.syncCampaignDocumentVectorDoc(updatedCampaign);
         this.publishUpsert(updatedCampaign);
       }
@@ -714,7 +681,6 @@ export class RedisCampaignCacheRepository
       );
       const updatedCampaign = await this.findCampaignCacheById(id);
       if (updatedCampaign) {
-        await this.syncCampaignTagVectorDocs(updatedCampaign);
         await this.syncCampaignDocumentVectorDoc(updatedCampaign);
         this.publishUpsert(updatedCampaign);
       }
@@ -724,16 +690,10 @@ export class RedisCampaignCacheRepository
     }
   }
 
-  // 태그 변경 시 임베딩 비우기
+  // 검색 대상 텍스트 변경 시 문서 임베딩 비우기
   async deleteCampaignEmbeddingById(id: string): Promise<void> {
     const key = this.getCampaignCacheKey(id);
     try {
-      await this.ioredisClient.call(
-        'JSON.SET',
-        key,
-        '$.embeddingTags',
-        JSON.stringify({})
-      );
       await Promise.all([
         this.ioredisClient.call(
           'JSON.SET',
@@ -747,7 +707,6 @@ export class RedisCampaignCacheRepository
           '$.embeddingModelVersion',
           JSON.stringify(null)
         ),
-        this.deleteCampaignTagVectorDocs(id),
         this.deleteCampaignDocumentVectorDoc(id),
       ]);
       const updatedCampaign = await this.findCampaignCacheById(id);
@@ -1142,38 +1101,6 @@ export class RedisCampaignCacheRepository
     return result === 1;
   }
 
-  async updateCampaignEmbeddingTags(
-    id: string,
-    embeddingTags: { [tagName: string]: number[] }
-  ): Promise<void> {
-    const key = this.getCampaignCacheKey(id);
-
-    try {
-      await Promise.all([
-        this.ioredisClient.call(
-          'JSON.SET',
-          key,
-          '$.embeddingTags',
-          JSON.stringify(embeddingTags)
-        ),
-        this.ioredisClient.call(
-          'JSON.SET',
-          key,
-          '$.embeddingModelVersion',
-          JSON.stringify(this.embeddingProfile.modelVersion)
-        ),
-      ]);
-      const campaign = await this.findCampaignCacheById(id);
-      if (campaign) {
-        await this.syncCampaignTagVectorDocs(campaign);
-        this.publishUpsert(campaign);
-      }
-    } catch (error) {
-      this.logger.error(`캠페인 임베딩 업데이트 실패: ${id}`, error);
-      throw error;
-    }
-  }
-
   async updateCampaignEmbeddings(
     id: string,
     payload: CampaignEmbeddingPayload
@@ -1184,9 +1111,6 @@ export class RedisCampaignCacheRepository
       );
     }
     this.assertEmbeddingDimension(payload.document, 'campaign document');
-    for (const [tagName, embedding] of Object.entries(payload.tags)) {
-      this.assertEmbeddingDimension(embedding, `campaign tag ${tagName}`);
-    }
 
     const key = this.getCampaignCacheKey(id);
     try {
@@ -1203,20 +1127,11 @@ export class RedisCampaignCacheRepository
         '$.embeddingDocument',
         JSON.stringify(payload.document)
       );
-      pipeline.call(
-        'JSON.SET',
-        key,
-        '$.embeddingTags',
-        JSON.stringify(payload.tags)
-      );
       await pipeline.exec();
 
       const campaign = await this.findCampaignCacheById(id);
       if (campaign) {
-        await Promise.all([
-          this.syncCampaignTagVectorDocs(campaign),
-          this.syncCampaignDocumentVectorDoc(campaign),
-        ]);
+        await this.syncCampaignDocumentVectorDoc(campaign);
         this.publishUpsert(campaign);
       }
     } catch (error) {
@@ -1225,56 +1140,8 @@ export class RedisCampaignCacheRepository
     }
   }
 
-  async searchCampaignTagVectors(
-    options: CampaignTagVectorSearchOptions
-  ): Promise<CampaignTagVectorSearchHit[]> {
-    const topL = Math.max(1, Math.floor(options.topL));
-    await this.ensureCampaignTagVectorIndex();
-
-    const vectorQuery = this.encodeFloat32Buffer(options.queryEmbedding);
-    const highIntentTag = options.isHighIntent ? '1' : '0';
-    const nowTs = Math.floor(options.nowTs);
-    const query =
-      `(@status:{ACTIVE} @isHighIntent:{${highIntentTag}} ` +
-      `@startTs:[-inf ${nowTs}] @endTs:[(${nowTs} +inf])` +
-      `=>[KNN ${topL} @embedding $query_vec AS vector_distance]`;
-
-    try {
-      const raw = await this.searchCircuitBreaker.execute(() =>
-        this.ioredisClient.call(
-          'FT.SEARCH',
-          this.campaignTagVectorIndex,
-          query,
-          'PARAMS',
-          '2',
-          'query_vec',
-          vectorQuery,
-          'SORTBY',
-          'vector_distance',
-          'ASC',
-          'RETURN',
-          '4',
-          'campaignId',
-          'servingVersion',
-          'tagName',
-          'vector_distance',
-          'LIMIT',
-          '0',
-          String(topL),
-          'DIALECT',
-          '2'
-        )
-      );
-
-      return this.parseCampaignTagVectorSearchResults(raw);
-    } catch (error) {
-      this.logger.error('campaign-tag ANN 검색 실패', error);
-      throw error;
-    }
-  }
-
   async searchCampaignDocumentVectors(
-    options: CampaignTagVectorSearchOptions
+    options: CampaignDocumentVectorSearchOptions
   ): Promise<CampaignDocumentVectorSearchHit[]> {
     const topL = Math.max(1, Math.floor(options.topL));
     await this.ensureCampaignDocumentVectorIndex();
@@ -1546,17 +1413,6 @@ export class RedisCampaignCacheRepository
     return new Date(epochMs + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
   }
 
-  private getCampaignTagVectorDocKey(
-    campaignId: string,
-    tagName: string
-  ): string {
-    return `${this.campaignTagVectorPrefix}${campaignId}:${encodeURIComponent(tagName)}`;
-  }
-
-  private getCampaignTagVectorKeysSet(campaignId: string): string {
-    return `${this.campaignTagVectorKeysPrefix}${campaignId}`;
-  }
-
   private getCampaignDocumentVectorDocKey(campaignId: string): string {
     return `${this.campaignDocumentVectorPrefix}${campaignId}`;
   }
@@ -1581,72 +1437,6 @@ export class RedisCampaignCacheRepository
         `${label} embedding 차원 불일치: ${values.length} vs ${this.embeddingDimension}`
       );
     }
-  }
-
-  private async ensureCampaignTagVectorIndex(): Promise<void> {
-    if (this.campaignTagVectorIndexReady) {
-      return this.campaignTagVectorIndexReady;
-    }
-
-    this.campaignTagVectorIndexReady = (async () => {
-      try {
-        await this.ioredisClient.call('FT.INFO', this.campaignTagVectorIndex);
-        return;
-      } catch {
-        // index가 없으면 아래에서 생성
-      }
-
-      try {
-        await this.ioredisClient.call(
-          'FT.CREATE',
-          this.campaignTagVectorIndex,
-          'ON',
-          'HASH',
-          'PREFIX',
-          '1',
-          this.campaignTagVectorPrefix,
-          'SCHEMA',
-          'campaignId',
-          'TAG',
-          'servingVersion',
-          'NUMERIC',
-          'tagName',
-          'TAG',
-          'status',
-          'TAG',
-          'isHighIntent',
-          'TAG',
-          'startTs',
-          'NUMERIC',
-          'endTs',
-          'NUMERIC',
-          'embedding',
-          'VECTOR',
-          'HNSW',
-          '10',
-          'TYPE',
-          'FLOAT32',
-          'DIM',
-          String(this.embeddingDimension),
-          'DISTANCE_METRIC',
-          'COSINE',
-          'M',
-          String(this.hnswGraphDegree),
-          'EF_CONSTRUCTION',
-          String(this.hnswEfConstruction)
-        );
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (!message.includes('Index already exists')) {
-          throw error;
-        }
-      }
-    })().catch((error) => {
-      this.campaignTagVectorIndexReady = null;
-      throw error;
-    });
-
-    return this.campaignTagVectorIndexReady;
   }
 
   private async ensureCampaignDocumentVectorIndex(): Promise<void> {
@@ -1719,73 +1509,6 @@ export class RedisCampaignCacheRepository
     }
   }
 
-  private async syncCampaignTagVectorDocs(
-    campaign: CachedCampaign | SearchCampaign
-  ): Promise<void> {
-    const compatible =
-      campaign.embeddingModelVersion === this.embeddingProfile.modelVersion ||
-      (this.embeddingProfile.name === 'legacy_minilm' &&
-        !campaign.embeddingModelVersion);
-    if (
-      !compatible ||
-      !campaign.tags ||
-      campaign.tags.length === 0 ||
-      !campaign.embeddingTags ||
-      Object.keys(campaign.embeddingTags).length === 0
-    ) {
-      await this.deleteCampaignTagVectorDocs(campaign.id);
-      return;
-    }
-
-    await this.ensureCampaignTagVectorIndex();
-    await this.deleteCampaignTagVectorDocs(campaign.id);
-
-    const startTs = new Date(campaign.startDate).getTime();
-    const endTs = new Date(campaign.endDate).getTime();
-    const vectorKeysSet = this.getCampaignTagVectorKeysSet(campaign.id);
-    const pipeline = this.ioredisClient.pipeline();
-    const activeTagKeys: string[] = [];
-
-    for (const tagName of campaign.tags) {
-      const embedding = campaign.embeddingTags[tagName];
-      if (!embedding || embedding.length !== this.embeddingDimension) {
-        continue;
-      }
-
-      const docKey = this.getCampaignTagVectorDocKey(campaign.id, tagName);
-      activeTagKeys.push(docKey);
-      pipeline.call(
-        'HSET',
-        docKey,
-        'campaignId',
-        campaign.id,
-        'servingVersion',
-        String(campaign.servingVersion),
-        'tagName',
-        tagName,
-        'status',
-        campaign.status,
-        'isHighIntent',
-        campaign.isHighIntent ? '1' : '0',
-        'startTs',
-        String(startTs),
-        'endTs',
-        String(endTs),
-        'embedding',
-        this.encodeFloat32Buffer(embedding)
-      );
-    }
-
-    if (activeTagKeys.length === 0) {
-      await pipeline.exec();
-      await this.deleteCampaignTagVectorDocs(campaign.id);
-      return;
-    }
-
-    pipeline.sadd(vectorKeysSet, ...activeTagKeys);
-    await pipeline.exec();
-  }
-
   private async syncCampaignDocumentVectorDoc(
     campaign: CachedCampaign | SearchCampaign
   ): Promise<void> {
@@ -1829,75 +1552,6 @@ export class RedisCampaignCacheRepository
     await this.ioredisClient.del(
       this.getCampaignDocumentVectorDocKey(campaignId)
     );
-  }
-
-  private async deleteCampaignTagVectorDocs(campaignId: string): Promise<void> {
-    const vectorKeysSet = this.getCampaignTagVectorKeysSet(campaignId);
-    const keys = await this.ioredisClient.smembers(vectorKeysSet);
-    const pipeline = this.ioredisClient.pipeline();
-
-    if (keys.length > 0) {
-      pipeline.del(...keys);
-    }
-    pipeline.del(vectorKeysSet);
-    await pipeline.exec();
-  }
-
-  private parseCampaignTagVectorSearchResults(
-    raw: unknown
-  ): CampaignTagVectorSearchHit[] {
-    if (!Array.isArray(raw) || raw.length === 0) {
-      return [];
-    }
-
-    const entries: unknown[] = raw;
-    const hits: CampaignTagVectorSearchHit[] = [];
-    for (let i = 1; i < entries.length; i += 2) {
-      const fields = entries[i + 1];
-      if (!Array.isArray(fields)) {
-        continue;
-      }
-
-      const fieldEntries: unknown[] = fields;
-      const fieldMap = new Map<string, string>();
-      for (let j = 0; j < fieldEntries.length; j += 2) {
-        const key = fieldEntries[j];
-        const value = fieldEntries[j + 1];
-        if (typeof key !== 'string') {
-          continue;
-        }
-        fieldMap.set(key, typeof value === 'string' ? value : String(value));
-      }
-
-      const campaignId = fieldMap.get('campaignId');
-      const servingVersion = Number(fieldMap.get('servingVersion'));
-      const tagName = fieldMap.get('tagName');
-      const distanceRaw = fieldMap.get('vector_distance');
-
-      if (
-        !campaignId ||
-        !Number.isFinite(servingVersion) ||
-        !tagName ||
-        distanceRaw === undefined
-      ) {
-        continue;
-      }
-
-      const distance = Number.parseFloat(distanceRaw);
-      if (!Number.isFinite(distance)) {
-        continue;
-      }
-
-      hits.push({
-        campaignId,
-        servingVersion,
-        tagName,
-        distance,
-        similarity: Math.max(0, 1 - distance),
-      });
-    }
-
-    return hits;
   }
 
   private parseCampaignDocumentVectorSearchResults(

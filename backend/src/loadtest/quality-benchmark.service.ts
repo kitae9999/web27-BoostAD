@@ -58,8 +58,6 @@ export class QualityBenchmarkService {
     datasetVersion: string;
     loadedCampaignCount: number;
     previousCampaignCount: number;
-    uniqueEmbeddedTagCount: number;
-    indexedTagVectorCount: number;
     indexedDocumentVectorCount: number;
     runtime: {
       embeddingProfile: string;
@@ -89,19 +87,16 @@ export class QualityBenchmarkService {
         allowStale: false,
       });
     try {
-      const embeddings = await this.buildTagEmbeddings(dto.campaigns);
       const qualityCampaigns: CachedCampaign[] = [];
       for (const campaign of dto.campaigns) {
         const document = await this.mlEngine.getEmbedding(
           buildCampaignDocumentText(campaign),
           'passage'
         );
-        qualityCampaigns.push(
-          this.toCachedCampaign(campaign, embeddings, document)
-        );
+        qualityCampaigns.push(this.toCachedCampaign(campaign, document));
       }
       await this.replaceServingCampaigns(previousCampaigns, qualityCampaigns);
-      const { indexedTagVectorCount, indexedDocumentVectorCount } =
+      const indexedDocumentVectorCount =
         await this.waitForAnnReady(qualityCampaigns);
 
       const sessionId = randomUUID();
@@ -118,8 +113,6 @@ export class QualityBenchmarkService {
         datasetVersion: dto.datasetVersion,
         loadedCampaignCount: qualityCampaigns.length,
         previousCampaignCount: previousCampaigns.length,
-        uniqueEmbeddedTagCount: embeddings.size,
-        indexedTagVectorCount,
         indexedDocumentVectorCount,
         runtime: this.runtimeMetadata(),
       };
@@ -302,7 +295,6 @@ export class QualityBenchmarkService {
       this.configService.get<string>('RTB_MATCHER_LOCAL_SNAPSHOT_ENABLED') ===
         'true';
     if (
-      this.configService.get<string>('RTB_MATCHER_ANN_ENABLED') !== 'true' ||
       this.configService.get<string>('RTB_CONTEXT_DECISION_ENABLED') !==
         'true' ||
       !localSnapshot
@@ -327,10 +319,7 @@ export class QualityBenchmarkService {
       modelId: this.mlEngine.getModelId(),
       modelVersion: this.mlEngine.getModelVersion(),
       embeddingDimension: this.mlEngine.getEmbeddingDimension(),
-      denseRetrievalMode: this.configService.get<string>(
-        'RTB_DENSE_RETRIEVAL_MODE',
-        'semantic_document'
-      ),
+      denseRetrievalMode: 'semantic_document',
       documentSimilarityThreshold: this.configService.get<string>(
         'RTB_MATCHER_DOCUMENT_SIMILARITY_THRESHOLD',
         '0.3'
@@ -377,35 +366,8 @@ export class QualityBenchmarkService {
     }
   }
 
-  private async buildTagEmbeddings(
-    campaigns: QualityCampaignDto[]
-  ): Promise<Map<string, number[]>> {
-    const normalizedTags = [
-      ...new Set(
-        campaigns.flatMap((campaign) =>
-          campaign.tags.map((tag) => this.normalizeText(tag)).filter(Boolean)
-        )
-      ),
-    ].sort();
-    const embeddings = new Map<string, number[]>();
-    for (const tag of normalizedTags) {
-      const embedding = await this.mlEngine.getEmbedding(tag, 'passage');
-      if (
-        embedding.length !== this.mlEngine.getEmbeddingDimension() ||
-        embedding.some((value) => !Number.isFinite(value))
-      ) {
-        throw new ServiceUnavailableException(
-          `quality tag embedding contract가 잘못됐습니다: ${tag}`
-        );
-      }
-      embeddings.set(tag, embedding);
-    }
-    return embeddings;
-  }
-
   private toCachedCampaign(
     input: QualityCampaignDto,
-    embeddings: ReadonlyMap<string, number[]>,
     document: number[]
   ): CachedCampaign {
     const tags = [
@@ -444,15 +406,6 @@ export class QualityBenchmarkService {
       tags,
       embeddingModelVersion: this.mlEngine.getModelVersion(),
       embeddingDocument: document,
-      embeddingTags: Object.fromEntries(
-        tags.map((tag) => {
-          const embedding = embeddings.get(tag);
-          if (!embedding) {
-            throw new Error(`quality tag embedding이 없습니다: ${tag}`);
-          }
-          return [tag, embedding];
-        })
-      ),
     };
   }
 
@@ -512,21 +465,9 @@ export class QualityBenchmarkService {
     );
   }
 
-  private async waitForAnnReady(campaigns: CachedCampaign[]): Promise<{
-    indexedTagVectorCount: number;
-    indexedDocumentVectorCount: number;
-  }> {
-    const expectedTagVectorCount = campaigns.reduce(
-      (sum, campaign) => sum + Object.keys(campaign.embeddingTags ?? {}).length,
-      0
-    );
-    const queryEmbedding = Object.values(campaigns[0]?.embeddingTags ?? {})[0];
+  private async waitForAnnReady(campaigns: CachedCampaign[]): Promise<number> {
     const documentQueryEmbedding = campaigns[0]?.embeddingDocument;
-    if (
-      !queryEmbedding ||
-      !documentQueryEmbedding ||
-      expectedTagVectorCount === 0
-    ) {
+    if (!documentQueryEmbedding) {
       throw new ServiceUnavailableException(
         'quality campaign ANN readiness를 확인할 embedding이 없습니다.'
       );
@@ -542,15 +483,6 @@ export class QualityBenchmarkService {
       50
     );
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const hits = await this.campaignCacheRepository.searchCampaignTagVectors({
-        queryEmbedding,
-        topL: expectedTagVectorCount,
-        isHighIntent: false,
-        nowTs: Date.now(),
-      });
-      const indexedQualityHits = hits.filter((hit) =>
-        qualityIds.has(hit.campaignId)
-      ).length;
       const documentHits =
         await this.campaignCacheRepository.searchCampaignDocumentVectors({
           queryEmbedding: documentQueryEmbedding,
@@ -561,20 +493,14 @@ export class QualityBenchmarkService {
       const indexedQualityDocuments = documentHits.filter((hit) =>
         qualityIds.has(hit.campaignId)
       ).length;
-      if (
-        indexedQualityHits >= expectedTagVectorCount &&
-        indexedQualityDocuments >= campaigns.length
-      ) {
-        return {
-          indexedTagVectorCount: indexedQualityHits,
-          indexedDocumentVectorCount: indexedQualityDocuments,
-        };
+      if (indexedQualityDocuments >= campaigns.length) {
+        return indexedQualityDocuments;
       }
       await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
     }
 
     throw new ServiceUnavailableException(
-      `quality campaign ANN index가 준비되지 않았습니다: expected=${expectedTagVectorCount}`
+      `quality campaign ANN index가 준비되지 않았습니다: expected=${campaigns.length}`
     );
   }
 

@@ -37,7 +37,7 @@ export interface DecisionContext {
 
 export interface Candidate extends Omit<
   ServingCampaign,
-  'embeddingTags' | 'embeddingDocument' | 'embeddingModelVersion'
+  'embeddingDocument' | 'embeddingModelVersion'
 > {
   similarity: number;
 }

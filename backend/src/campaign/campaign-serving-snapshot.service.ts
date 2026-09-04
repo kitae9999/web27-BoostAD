@@ -66,7 +66,6 @@ export class CampaignServingSnapshotService
   >();
   private readonly enabled: boolean;
   private readonly embeddingProfile: EmbeddingProfile;
-  private readonly requireDocumentEmbedding: boolean;
   private readonly streamEnabled: boolean;
   private readonly sourceRedis?: AppIORedisClient;
   private streamRedis?: AppIORedisClient;
@@ -90,11 +89,6 @@ export class CampaignServingSnapshotService
     this.embeddingProfile = resolveEmbeddingProfile(
       configService.get<string>('RTB_EMBEDDING_PROFILE')
     );
-    this.requireDocumentEmbedding =
-      configService.get<string>(
-        'RTB_DENSE_RETRIEVAL_MODE',
-        'semantic_document'
-      ) === 'semantic_document';
     const campaignSource = configService.get<string>('RTB_CAMPAIGN_SOURCE');
     this.enabled = campaignSource
       ? campaignSource === 'local_snapshot'
@@ -569,23 +563,11 @@ export class CampaignServingSnapshotService
   }
 
   private hasRequiredEmbeddings(campaign: ServingCampaign): boolean {
-    const hasTags = Boolean(
-      campaign.tags?.length &&
-      campaign.tags.every(
-        (tagName) =>
-          campaign.embeddingTags?.[tagName]?.length ===
-          this.embeddingProfile.dimension
-      )
-    );
     const compatible =
-      campaign.embeddingModelVersion === this.embeddingProfile.modelVersion ||
-      (this.embeddingProfile.name === 'legacy_minilm' &&
-        !campaign.embeddingModelVersion);
+      campaign.embeddingModelVersion === this.embeddingProfile.modelVersion;
     const hasDocument =
       campaign.embeddingDocument?.length === this.embeddingProfile.dimension;
-    return Boolean(
-      compatible && hasTags && (!this.requireDocumentEmbedding || hasDocument)
-    );
+    return Boolean(compatible && hasDocument);
   }
 
   private buildTagIndex(

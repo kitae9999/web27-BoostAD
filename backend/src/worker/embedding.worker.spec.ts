@@ -169,7 +169,7 @@ describe('EmbeddingWorker lifecycle', () => {
     expect(contextEmbeddingService.failJob).not.toHaveBeenCalled();
   });
 
-  it('publishes campaign tag and document embeddings from passage inputs', async () => {
+  it('publishes one campaign document embedding from a passage input', async () => {
     const { worker, mlEngine, repository } = buildWorker(true);
     repository.findCampaignCacheById.mockResolvedValue({
       id: 'campaign-1',
@@ -177,10 +177,7 @@ describe('EmbeddingWorker lifecycle', () => {
       content: 'React 렌더링 병목을 분석합니다.',
       tags: ['React', 'TypeScript'],
     });
-    mlEngine.getEmbedding
-      .mockResolvedValueOnce([0.1, 0.2])
-      .mockResolvedValueOnce([0.3, 0.4])
-      .mockResolvedValueOnce([0.5, 0.6]);
+    mlEngine.getEmbedding.mockResolvedValueOnce([0.5, 0.6]);
 
     await worker.process({
       id: 'campaign-job',
@@ -188,18 +185,8 @@ describe('EmbeddingWorker lifecycle', () => {
       data: { campaignId: 'campaign-1' },
     } as unknown as Job);
 
-    expect(mlEngine.getEmbedding).toHaveBeenNthCalledWith(
-      1,
-      'React',
-      'passage'
-    );
-    expect(mlEngine.getEmbedding).toHaveBeenNthCalledWith(
-      2,
-      'TypeScript',
-      'passage'
-    );
-    expect(mlEngine.getEmbedding).toHaveBeenNthCalledWith(
-      3,
+    expect(mlEngine.getEmbedding).toHaveBeenCalledTimes(1);
+    expect(mlEngine.getEmbedding).toHaveBeenCalledWith(
       '프론트엔드 진단\nReact 렌더링 병목을 분석합니다.\nReact TypeScript',
       'passage'
     );
@@ -208,10 +195,6 @@ describe('EmbeddingWorker lifecycle', () => {
       {
         modelVersion: 'model-v2',
         document: [0.5, 0.6],
-        tags: {
-          React: [0.1, 0.2],
-          TypeScript: [0.3, 0.4],
-        },
       }
     );
   });
