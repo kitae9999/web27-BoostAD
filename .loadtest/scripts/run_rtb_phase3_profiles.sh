@@ -24,6 +24,7 @@ expected_embedding_replicas="${EXPECTED_EMBEDDING_WORKER_REPLICAS:-1}"
 expected_reservation_replicas="${EXPECTED_RESERVATION_WORKER_REPLICAS:-1}"
 k6_quiet="${K6_QUIET:-false}"
 load_monitor_interval_secs="${LOAD_MONITOR_INTERVAL_SECS:-0}"
+resource_monitor_interval_secs="${RESOURCE_MONITOR_INTERVAL_SECS:-5}"
 duration_sec="$(parse_duration_sec "$duration")"
 suite_failed=0
 
@@ -195,6 +196,7 @@ run_content_profile() {
   local failed_before
   failed_before="$(embedding_failed_job_count)"
   capture_loadtest_container_stats "${cell_dir}/container_stats_before.ndjson" || true
+  capture_redis_role_info "${cell_dir}/redis_info_before.txt" || true
 
   reset_state "${cell_dir}/reset.json" || return 1
   if ! boost_campaign_budgets >"${cell_dir}/stable_budget.log" 2>&1; then
@@ -212,11 +214,18 @@ run_content_profile() {
     k6_args+=(--quiet)
   fi
   local monitor_pid=""
+  local resource_monitor_pid=""
   if [ "$load_monitor_interval_secs" -gt 0 ]; then
     monitor_embedding_queue \
       "${cell_dir}/queue_during_load.tsv" \
       "$load_monitor_interval_secs" &
     monitor_pid=$!
+  fi
+  if [ "$resource_monitor_interval_secs" -gt 0 ]; then
+    monitor_loadtest_container_stats \
+      "${cell_dir}/container_stats_timeseries.ndjson" \
+      "$resource_monitor_interval_secs" &
+    resource_monitor_pid=$!
   fi
   (
     cd "$loadtest_dir"
@@ -233,9 +242,14 @@ run_content_profile() {
     kill "$monitor_pid" 2>/dev/null || true
     wait "$monitor_pid" 2>/dev/null || true
   fi
+  if [ -n "$resource_monitor_pid" ]; then
+    kill "$resource_monitor_pid" 2>/dev/null || true
+    wait "$resource_monitor_pid" 2>/dev/null || true
+  fi
   printf '%s\n' "$k6_rc" >"${cell_dir}/k6_exit_code.txt"
   # Preserve raw artifacts regardless of threshold/k6 outcome.
   curl -fsS "${base_url}/api/metrics" >"${cell_dir}/metrics_after.txt"
+  capture_redis_role_info "${cell_dir}/redis_info_after.txt" || true
   read -r q_wait_after q_active_after q_delayed_after <<<"$(embedding_queue_counts)"
   printf '%s %s %s\n' "$q_wait_after" "$q_active_after" "$q_delayed_after" \
     >"${cell_dir}/queue_after.txt"

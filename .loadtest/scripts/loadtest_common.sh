@@ -51,8 +51,21 @@ parse_duration_sec() {
   esac
 }
 
+search_redis_cli() {
+  docker exec "${SEARCH_REDIS_CONTAINER:-boostad-search-redis-local}" redis-cli "$@"
+}
+
+budget_redis_cli() {
+  docker exec "${BUDGET_REDIS_CONTAINER:-boostad-budget-redis-local}" redis-cli "$@"
+}
+
+queue_redis_cli() {
+  docker exec "${QUEUE_REDIS_CONTAINER:-boostad-queue-redis-local}" redis-cli "$@"
+}
+
+# BullMQ state belongs to Queue Redis in split topology.
 redis_cli() {
-  docker exec boostad-redis-master-local redis-cli "$@"
+  queue_redis_cli "$@"
 }
 
 embedding_queue_name() {
@@ -86,13 +99,53 @@ embedding_failed_job_count() {
 capture_loadtest_container_stats() {
   local output="$1"
   local ids
-  ids="$(loadtest_compose ps -q backend embedding-worker reservation-worker redis mysql 2>/dev/null)"
+  ids="$(loadtest_compose ps -q \
+    backend embedding-worker reservation-worker projection-worker \
+    search-redis budget-redis queue-redis mysql 2>/dev/null)"
   if [ -z "$ids" ]; then
     : >"$output"
     return 1
   fi
   # shellcheck disable=SC2086
   docker stats --no-stream --format '{{json .}}' $ids >"$output"
+}
+
+capture_redis_role_info() {
+  local output="$1"
+  local role container
+  : >"$output"
+  while read -r role container; do
+    printf '[%s]\n' "$role" >>"$output"
+    docker exec "$container" redis-cli INFO cpu >>"$output" 2>/dev/null || true
+    docker exec "$container" redis-cli INFO stats >>"$output" 2>/dev/null || true
+    docker exec "$container" redis-cli INFO commandstats >>"$output" 2>/dev/null || true
+  done <<EOF
+search ${SEARCH_REDIS_CONTAINER:-boostad-search-redis-local}
+budget ${BUDGET_REDIS_CONTAINER:-boostad-budget-redis-local}
+queue ${QUEUE_REDIS_CONTAINER:-boostad-queue-redis-local}
+EOF
+}
+
+monitor_loadtest_container_stats() {
+  local output="$1"
+  local interval="$2"
+  local ids sampled_at
+  ids="$(loadtest_compose ps -q \
+    backend embedding-worker reservation-worker projection-worker \
+    search-redis budget-redis queue-redis mysql 2>/dev/null)"
+  : >"$output"
+  if [ -z "$ids" ]; then
+    return 1
+  fi
+
+  while true; do
+    sampled_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # shellcheck disable=SC2086
+    docker stats --no-stream --format '{{json .}}' $ids 2>/dev/null |
+      jq -c --arg sampledAt "$sampled_at" '. + {sampledAt:$sampledAt}' \
+        >>"$output" || true
+    sleep "$interval"
+  done
 }
 
 assert_embedding_queue_empty() {
@@ -111,11 +164,33 @@ assert_embedding_queue_empty() {
 # Sets daily/total budget to 2e9 and spent to 0. Asserts modified == EXPECTED_CAMPAIGN_COUNT.
 apply_stable_budget() {
   local expected="${EXPECTED_CAMPAIGN_COUNT:-1000}"
-  local redis_container="${REDIS_CONTAINER:-boostad-redis-master-local}"
   local modified
   local lua
 
-  lua='
+  if [ "${REDIS_TOPOLOGY_MODE:-split}" = "split" ]; then
+    lua='
+local cursor = "0"
+local n = 0
+repeat
+  local page = redis.call("SCAN", cursor, "MATCH", "budget:campaign:*", "COUNT", 1000)
+  cursor = page[1]
+  for _, key in ipairs(page[2]) do
+    redis.call("HSET", key,
+      "dailyBudget", "2000000000",
+      "totalBudget", "2000000000",
+      "dailySpent", "0",
+      "totalSpent", "0",
+      "dailyReserved", "0",
+      "totalReserved", "0")
+    n = n + 1
+  end
+until cursor == "0"
+return n
+'
+    modified="$(budget_redis_cli EVAL "$lua" 0)"
+  else
+    local redis_container="${REDIS_CONTAINER:-boostad-redis-master-local}"
+    lua='
 local keys = redis.call("SMEMBERS", KEYS[1])
 local n = 0
 for _, key in ipairs(keys) do
@@ -129,10 +204,10 @@ for _, key in ipairs(keys) do
 end
 return n
 '
-
-  modified="$(
-    docker exec "$redis_container" redis-cli EVAL "$lua" 1 campaign:keys
-  )"
+    modified="$(
+      docker exec "$redis_container" redis-cli EVAL "$lua" 1 campaign:keys
+    )"
+  fi
   modified="$(printf '%s' "$modified" | tr -d '[:space:]')"
   if [ -z "$modified" ] || [ "$modified" = "(nil)" ]; then
     modified=0
