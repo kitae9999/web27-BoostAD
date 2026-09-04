@@ -1,6 +1,9 @@
 import { ConfigService } from '@nestjs/config';
 import { CacheRepository } from 'src/cache/repository/cache.repository.interface';
 import { CampaignCacheRepository } from 'src/campaign/repository/campaign.cache.repository.interface';
+import type { CampaignBudgetRepository } from 'src/campaign/repository/campaign-budget.repository.interface';
+import type { CampaignSearchRepository } from 'src/campaign/repository/campaign-search.repository.interface';
+import type { CampaignServingSnapshotService } from 'src/campaign/campaign-serving-snapshot.service';
 import type {
   ReserveAuctionRequest,
   ReserveAuctionResult,
@@ -29,6 +32,8 @@ type RepositoryMocks = {
   reserveAuction: ReserveAuctionMock;
   decrementSpent: jest.Mock<Promise<void>, [string, number]>;
   findCampaignCacheById: jest.Mock;
+  findCampaignById: jest.Mock;
+  releaseAuction: jest.Mock;
 };
 
 type MetricMocks = {
@@ -47,6 +52,7 @@ type MetricMocks = {
 
 type Harness = {
   service: RTBService;
+  matcher: { matchCandidates: jest.Mock };
   repositoryMocks: RepositoryMocks;
   metricMocks: MetricMocks;
   bidlogAdd: jest.Mock<Promise<void>, [string, BidLogJobData]>;
@@ -76,6 +82,7 @@ describe('RTBService winner-only reservation', () => {
     image: null,
     url: 'https://example.com/ad',
     maxCpc: 10,
+    servingVersion: 1,
     isHighIntent: false,
     status: 'ACTIVE',
     startDate: new Date(Date.now() - 1000).toISOString(),
@@ -91,8 +98,11 @@ describe('RTBService winner-only reservation', () => {
     candidates: ScoredCandidate[],
     options: {
       mode?: 'winner_only' | 'legacy_topk';
+      topology?: 'legacy' | 'split';
       incrementSpent?: IncrementSpentMock;
       reserveAuction?: ReserveAuctionMock;
+      findCampaignById?: jest.Mock;
+      findSnapshotCampaignsByIds?: jest.Mock;
     } = {}
   ): Harness => {
     const matcher = {
@@ -127,11 +137,12 @@ describe('RTBService winner-only reservation', () => {
               outcome: 'reserved',
               attemptedCount: 1,
               reservation: {
-                version: 1,
+                version: 2,
                 auctionId: request.auctionId,
                 campaignId: winner.campaignId,
+                campaignServingVersion: winner.servingVersion,
                 blogId: request.blogId,
-                cost: winner.cpc,
+                cost: 10,
                 status: 'RESERVED',
                 budgetDate: request.budgetDate,
                 createdAt: 1,
@@ -144,6 +155,8 @@ describe('RTBService winner-only reservation', () => {
         .fn<Promise<void>, [string, number]>()
         .mockResolvedValue(undefined),
       findCampaignCacheById: jest.fn(),
+      findCampaignById: options.findCampaignById ?? jest.fn(),
+      releaseAuction: jest.fn().mockResolvedValue({ outcome: 'released' }),
     };
     const campaignCacheRepository =
       repositoryMocks as unknown as CampaignCacheRepository;
@@ -156,7 +169,9 @@ describe('RTBService winner-only reservation', () => {
       get: jest.fn((key: string, defaultValue?: string) =>
         key === 'RTB_BUDGET_MODE'
           ? (options.mode ?? defaultValue)
-          : defaultValue
+          : key === 'REDIS_TOPOLOGY_MODE'
+            ? (options.topology ?? 'split')
+            : defaultValue
       ),
     } as unknown as ConfigService;
 
@@ -167,11 +182,19 @@ describe('RTBService winner-only reservation', () => {
       campaignCacheRepository,
       metricsService,
       bidlogQueue,
-      configService
+      configService,
+      repositoryMocks as unknown as CampaignSearchRepository,
+      repositoryMocks as unknown as CampaignBudgetRepository,
+      options.findSnapshotCampaignsByIds
+        ? ({
+            findCampaignsByIds: options.findSnapshotCampaignsByIds,
+          } as unknown as CampaignServingSnapshotService)
+        : undefined
     );
 
     return {
       service,
+      matcher,
       repositoryMocks,
       metricMocks,
       bidlogAdd,
@@ -196,8 +219,8 @@ describe('RTBService winner-only reservation', () => {
     expect(reservationRequest.budgetDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     expect(typeof reservationRequest.expiresAt).toBe('number');
     expect(reservationRequest.candidates).toEqual([
-      { campaignId: high.id, cpc: 10 },
-      { campaignId: low.id, cpc: 10 },
+      { campaignId: high.id, servingVersion: 1 },
+      { campaignId: low.id, servingVersion: 1 },
     ]);
     expect(harness.cacheSetAuctionData).not.toHaveBeenCalled();
     expect(harness.repositoryMocks.incrementSpent).not.toHaveBeenCalled();
@@ -211,7 +234,8 @@ describe('RTBService winner-only reservation', () => {
         items: [
           expect.objectContaining({ campaignId: high.id, status: 'WIN' }),
         ],
-      })
+      }),
+      expect.objectContaining({ jobId: expect.stringMatching(/^bidlog-/) })
     );
   });
 
@@ -226,9 +250,10 @@ describe('RTBService winner-only reservation', () => {
           outcome: 'reserved',
           attemptedCount: 2,
           reservation: {
-            version: 1,
+            version: 2,
             auctionId: request.auctionId,
             campaignId: second.id,
+            campaignServingVersion: second.servingVersion,
             blogId: request.blogId,
             cost: second.maxCpc,
             status: 'RESERVED',
@@ -293,9 +318,10 @@ describe('RTBService winner-only reservation', () => {
           outcome: 'reserved',
           attemptedCount: 1,
           reservation: {
-            version: 1,
+            version: 2,
             auctionId: request.auctionId,
             campaignId: candidates[10].id,
+            campaignServingVersion: candidates[10].servingVersion,
             blogId: request.blogId,
             cost: candidates[10].maxCpc,
             status: 'RESERVED',
@@ -321,7 +347,7 @@ describe('RTBService winner-only reservation', () => {
       expect.objectContaining({
         candidates: candidates.slice(0, 10).map((candidate) => ({
           campaignId: candidate.id,
-          cpc: candidate.maxCpc,
+          servingVersion: candidate.servingVersion,
         })),
       })
     );
@@ -330,7 +356,7 @@ describe('RTBService winner-only reservation', () => {
       expect.objectContaining({
         candidates: candidates.slice(10).map((candidate) => ({
           campaignId: candidate.id,
-          cpc: candidate.maxCpc,
+          servingVersion: candidate.servingVersion,
         })),
       })
     );
@@ -362,9 +388,10 @@ describe('RTBService winner-only reservation', () => {
           outcome: 'reserved',
           attemptedCount: 1,
           reservation: {
-            version: 1,
+            version: 2,
             auctionId: request.auctionId,
             campaignId: candidate.id,
+            campaignServingVersion: candidate.servingVersion,
             blogId: request.blogId,
             cost: candidate.maxCpc,
             status: 'RESERVED',
@@ -391,6 +418,116 @@ describe('RTBService winner-only reservation', () => {
     expect(harness.bidlogAdd).toHaveBeenCalledTimes(10);
     expect(harness.repositoryMocks.decrementSpent).not.toHaveBeenCalled();
     expect(harness.cacheSetAuctionData).not.toHaveBeenCalled();
+  });
+
+  it('rematches once when Search and Budget versions differ', async () => {
+    const stale = buildCandidate('campaign-1', 100, { servingVersion: 3 });
+    const fresh = buildCandidate('campaign-1', 100, { servingVersion: 4 });
+    const reserveAuction = jest
+      .fn<Promise<ReserveAuctionResult>, [ReserveAuctionRequest]>()
+      .mockResolvedValueOnce({
+        outcome: 'version_mismatch',
+        attemptedCount: 1,
+        versionMismatchCount: 1,
+      })
+      .mockImplementationOnce((request) =>
+        Promise.resolve({
+          outcome: 'reserved',
+          attemptedCount: 1,
+          reservation: {
+            version: 2,
+            auctionId: request.auctionId,
+            campaignId: fresh.id,
+            campaignServingVersion: fresh.servingVersion,
+            blogId: request.blogId,
+            cost: fresh.maxCpc,
+            status: 'RESERVED',
+            budgetDate: request.budgetDate,
+            createdAt: 1,
+            updatedAt: 1,
+            expiresAt: request.expiresAt,
+          },
+        })
+      );
+    const harness = buildHarness([stale], {
+      mode: 'winner_only',
+      reserveAuction,
+    });
+    harness.matcher.matchCandidates
+      .mockResolvedValueOnce([stale])
+      .mockResolvedValueOnce([fresh]);
+
+    const result = await harness.service.runAuction(context);
+
+    expect(result.status).toBe('success');
+    expect(result.data?.campaign.servingVersion).toBe(4);
+    expect(harness.matcher.matchCandidates).toHaveBeenCalledTimes(2);
+    expect(reserveAuction).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        candidates: [{ campaignId: fresh.id, servingVersion: 4 }],
+      })
+    );
+    expect(harness.metricMocks.incRtbReservationFailure).toHaveBeenCalledWith(
+      'version_mismatch'
+    );
+  });
+
+  it('returns no-bid after a second version mismatch', async () => {
+    const candidate = buildCandidate('campaign-1', 100, {
+      servingVersion: 3,
+    });
+    const harness = buildHarness([candidate], {
+      mode: 'winner_only',
+      reserveAuction: jest
+        .fn<Promise<ReserveAuctionResult>, [ReserveAuctionRequest]>()
+        .mockResolvedValue({
+          outcome: 'version_mismatch',
+          attemptedCount: 1,
+          versionMismatchCount: 1,
+        }),
+    });
+
+    const result = await harness.service.runAuction(context);
+
+    expect(result.status).toBe('error');
+    expect(harness.matcher.matchCandidates).toHaveBeenCalledTimes(2);
+    expect(harness.repositoryMocks.reserveAuction).toHaveBeenCalledTimes(2);
+    expect(harness.bidlogAdd).not.toHaveBeenCalled();
+  });
+
+  it('releases a reservation immediately when Queue enqueue fails', async () => {
+    const candidate = buildCandidate('campaign-1', 100);
+    const harness = buildHarness([candidate], { mode: 'winner_only' });
+    harness.bidlogAdd.mockRejectedValueOnce(new Error('queue unavailable'));
+
+    const result = await harness.service.runAuction(context);
+
+    expect(result.status).toBe('error');
+    const reservationRequest =
+      harness.repositoryMocks.reserveAuction.mock.calls[0][0];
+    expect(harness.repositoryMocks.releaseAuction).toHaveBeenCalledWith(
+      reservationRequest.auctionId,
+      1800
+    );
+  });
+
+  it('uses the local COW snapshot when fallback Search lookup is unavailable', async () => {
+    const fallback = buildCandidate('c1dda7a5-da58-416b-b8fa-20ba8f5535f9', 0);
+    const findSnapshotCampaignsByIds = jest.fn().mockResolvedValue([fallback]);
+    const harness = buildHarness([], {
+      mode: 'winner_only',
+      findCampaignById: jest
+        .fn()
+        .mockRejectedValue(new Error('search unavailable')),
+      findSnapshotCampaignsByIds,
+    });
+
+    const result = await harness.service.runAuction(context);
+
+    expect(result.status).toBe('success');
+    expect(result.data?.campaign.id).toBe(fallback.id);
+    expect(findSnapshotCampaignsByIds).toHaveBeenCalledWith([fallback.id]);
   });
 
   it('retains legacy top-k rollback behind the rollback flag', async () => {

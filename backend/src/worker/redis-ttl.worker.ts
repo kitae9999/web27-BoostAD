@@ -6,12 +6,14 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import Redis from 'ioredis';
-import { IOREDIS_CLIENT } from 'src/redis/redis.constant';
+import { BUDGET_REDIS_CLIENT } from 'src/redis/redis.constant';
 import type { AppIORedisClient } from 'src/redis/redis.type';
 import { CacheRepository } from '../cache/repository/cache.repository.interface';
 import { CampaignCacheRepository } from 'src/campaign/repository/campaign.cache.repository.interface';
 import { ConfigService } from '@nestjs/config';
 import { AUCTION_TERMINAL_TTL_SECONDS } from 'src/campaign/constants/auction-reservation.constants';
+import { CampaignBudgetRepository } from 'src/campaign/repository/campaign-budget.repository.interface';
+import { Optional } from '@nestjs/common';
 
 // TTL 만료 이벤트를 감지하여 롤백을 수행하는 Worker
 @Injectable()
@@ -25,13 +27,19 @@ export class RedisTTLWorker implements OnModuleInit, OnModuleDestroy {
   private readonly reservationSweepTimeBudgetMs: number;
   private readonly reservationSweepMaxBatches: number;
   private readonly auctionTerminalTtlSeconds: number;
+  private readonly budgetRepository: CampaignBudgetRepository;
 
   constructor(
-    @Inject(IOREDIS_CLIENT) private readonly ioRedisClient: AppIORedisClient,
+    @Inject(BUDGET_REDIS_CLIENT)
+    private readonly ioRedisClient: AppIORedisClient,
     private readonly cacheRepository: CacheRepository,
     private readonly campaignCacheRepository: CampaignCacheRepository,
-    private readonly configService: ConfigService
+    private readonly configService: ConfigService,
+    @Optional() budgetRepository?: CampaignBudgetRepository
   ) {
+    this.budgetRepository =
+      budgetRepository ??
+      (campaignCacheRepository as unknown as CampaignBudgetRepository);
     this.reservationSweepIntervalMs = this.getPositiveIntConfig(
       'RTB_RESERVATION_SWEEP_INTERVAL_MS',
       1_000
@@ -114,7 +122,7 @@ export class RedisTTLWorker implements OnModuleInit, OnModuleDestroy {
       const elapsedMs = Date.now() - new Date(createdAt).getTime();
 
       // 롤백 수행
-      await this.campaignCacheRepository.decrementSpent(campaignId, cost);
+      await this.budgetRepository.decrementSpent(campaignId, cost);
 
       // 백업 삭제
       await this.cacheRepository.deleteRollbackBackup(viewId);
@@ -146,16 +154,15 @@ export class RedisTTLWorker implements OnModuleInit, OnModuleDestroy {
         batch < this.reservationSweepMaxBatches && Date.now() <= deadline;
         batch += 1
       ) {
-        const auctionIds =
-          await this.campaignCacheRepository.findExpiredAuctionIds(
-            Date.now(),
-            this.reservationSweepBatchSize
-          );
+        const auctionIds = await this.budgetRepository.findExpiredAuctionIds(
+          Date.now(),
+          this.reservationSweepBatchSize
+        );
         if (auctionIds.length === 0) break;
 
         const results = await Promise.allSettled(
           auctionIds.map((auctionId) =>
-            this.campaignCacheRepository.releaseAuction(
+            this.budgetRepository.releaseAuction(
               auctionId,
               this.auctionTerminalTtlSeconds
             )

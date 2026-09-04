@@ -4,6 +4,7 @@ import { EmbeddingWorker } from './embedding.worker';
 import { ContextEmbeddingService } from 'src/rtb/context/context-embedding.service';
 import { MetricsService } from 'src/metrics/metrics.service';
 import { Job } from 'bullmq';
+import { CampaignSearchRepository } from 'src/campaign/repository/campaign-search.repository.interface';
 
 describe('EmbeddingWorker lifecycle', () => {
   const buildWorker = (modelReady: boolean) => {
@@ -29,11 +30,17 @@ describe('EmbeddingWorker lifecycle', () => {
       recordRtbContextJob: jest.fn(),
       observeRtbContextEmbeddingDuration: jest.fn(),
     } as unknown as MetricsService;
+    const searchRepository = {
+      updateEmbeddingsIfCurrent: jest.fn().mockResolvedValue(true),
+    } as unknown as CampaignSearchRepository & {
+      updateEmbeddingsIfCurrent: jest.Mock;
+    };
     const worker = new EmbeddingWorker(
       mlEngine,
       repository,
       contextEmbeddingService,
-      metricsService
+      metricsService,
+      searchRepository
     );
     const bullWorker = {
       isRunning: jest.fn(() => false),
@@ -50,6 +57,7 @@ describe('EmbeddingWorker lifecycle', () => {
       bullWorker,
       mlEngine: mlEngine as unknown as { getEmbedding: jest.Mock },
       repository,
+      searchRepository,
       contextEmbeddingService: contextEmbeddingServiceMock,
     };
   };
@@ -206,5 +214,53 @@ describe('EmbeddingWorker lifecycle', () => {
         },
       }
     );
+  });
+
+  it('uses version and semantic hash CAS for projection embedding jobs', async () => {
+    const { worker, searchRepository, repository } = buildWorker(true);
+
+    await worker.process({
+      id: 'campaign-v3',
+      name: 'generate-campaign-embedding',
+      data: {
+        campaignId: 'campaign-1',
+        servingVersion: 3,
+        semanticHash: 'hash-v3',
+        modelVersion: 'model-v2',
+        title: 'Redis',
+        content: '역할 분리',
+        tags: ['redis'],
+      },
+    } as unknown as Job);
+
+    expect(searchRepository.updateEmbeddingsIfCurrent).toHaveBeenCalledWith(
+      'campaign-1',
+      3,
+      'hash-v3',
+      expect.objectContaining({ modelVersion: 'model-v2' })
+    );
+    expect(repository.findCampaignCacheById).not.toHaveBeenCalled();
+    expect(repository.updateCampaignEmbeddings).not.toHaveBeenCalled();
+  });
+
+  it('does not publish a stale projection embedding through the legacy path', async () => {
+    const { worker, searchRepository, repository } = buildWorker(true);
+    searchRepository.updateEmbeddingsIfCurrent.mockResolvedValue(false);
+
+    await worker.process({
+      id: 'campaign-stale',
+      name: 'generate-campaign-embedding',
+      data: {
+        campaignId: 'campaign-1',
+        servingVersion: 2,
+        semanticHash: 'old-hash',
+        modelVersion: 'model-v2',
+        title: 'old',
+        content: 'old',
+        tags: ['redis'],
+      },
+    } as unknown as Job);
+
+    expect(repository.updateCampaignEmbeddings).not.toHaveBeenCalled();
   });
 });

@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { Matcher } from './matchers/matcher.interface';
 import { CampaignSelector } from './selectors/selector.interface';
 import type {
@@ -21,10 +21,19 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { BidLogJobData } from '../queue/types/queue.type';
 import { ConfigService } from '@nestjs/config';
-import { AUCTION_RESERVATION_TTL_MS } from '../campaign/constants/auction-reservation.constants';
+import {
+  AUCTION_RESERVATION_TTL_MS,
+  AUCTION_TERMINAL_TTL_SECONDS,
+} from '../campaign/constants/auction-reservation.constants';
 import type { ActiveAuctionReservation } from '../campaign/types/campaign.types';
+import { CircuitBreaker } from '../common/resilience/circuit-breaker';
+import { CampaignSearchRepository } from '../campaign/repository/campaign-search.repository.interface';
+import { CampaignBudgetRepository } from '../campaign/repository/campaign-budget.repository.interface';
+import { CampaignServingSnapshotService } from '../campaign/campaign-serving-snapshot.service';
 
 type BudgetMode = 'legacy_topk' | 'winner_only';
+
+class CampaignVersionMismatchError extends Error {}
 
 @Injectable()
 export class RTBService {
@@ -34,7 +43,12 @@ export class RTBService {
     'c1dda7a5-da58-416b-b8fa-20ba8f5535f9';
   private readonly TOP_K = 10;
   private readonly budgetMode: BudgetMode;
+  private readonly splitRedisTopology: boolean;
   private readonly auctionReservationTtlMs: number;
+  private readonly auctionTerminalTtlSeconds: number;
+  private readonly queueCircuitBreaker: CircuitBreaker;
+  private readonly searchRepository: CampaignSearchRepository;
+  private readonly budgetRepository: CampaignBudgetRepository;
 
   constructor(
     private readonly matcher: Matcher,
@@ -44,14 +58,36 @@ export class RTBService {
     private readonly metricsService: MetricsService,
     @InjectQueue('bidlog-queue')
     private readonly bidlogQueue: Queue<BidLogJobData>,
-    private readonly configService: ConfigService
+    private readonly configService: ConfigService,
+    @Optional() searchRepository?: CampaignSearchRepository,
+    @Optional() budgetRepository?: CampaignBudgetRepository,
+    @Optional()
+    private readonly campaignServingSnapshot?: CampaignServingSnapshotService
   ) {
+    this.searchRepository =
+      searchRepository ??
+      (campaignCacheRepository as unknown as CampaignSearchRepository);
+    this.budgetRepository =
+      budgetRepository ??
+      (campaignCacheRepository as unknown as CampaignBudgetRepository);
     this.budgetMode = this.resolveBudgetMode(
       this.configService.get<string>('RTB_BUDGET_MODE', 'legacy_topk')
     );
+    this.splitRedisTopology =
+      this.configService.get<string>('REDIS_TOPOLOGY_MODE', 'legacy') ===
+      'split';
     this.auctionReservationTtlMs = this.getPositiveIntConfig(
       'RTB_AUCTION_RESERVATION_TTL_MS',
       AUCTION_RESERVATION_TTL_MS
+    );
+    this.auctionTerminalTtlSeconds = this.getPositiveIntConfig(
+      'RTB_AUCTION_TERMINAL_TTL_SECONDS',
+      AUCTION_TERMINAL_TTL_SECONDS
+    );
+    this.queueCircuitBreaker = new CircuitBreaker(
+      'queue-redis',
+      this.getPositiveIntConfig('REDIS_CIRCUIT_BREAKER_FAILURE_THRESHOLD', 5),
+      this.getPositiveIntConfig('REDIS_CIRCUIT_BREAKER_OPEN_MS', 5_000)
     );
   }
 
@@ -94,23 +130,13 @@ export class RTBService {
         candidates = await this.measureStage(
           'fallback_lookup',
           async () => {
-            const fallbackCampaign = await this.measureDependency(
-              'redis',
-              'find_fallback_campaign',
-              () =>
-                this.campaignCacheRepository.findCampaignCacheById(
-                  this.FALLBACK_CAMPAIGN_ID
-                )
-            );
+            const fallbackCampaign = await this.findFallbackCampaign();
 
             if (!fallbackCampaign) {
               throw new Error('Fallback 캠페인을 찾을 수 없습니다');
             }
 
-            const candidate = createCandidate(
-              toServingCampaign(fallbackCampaign),
-              0
-            );
+            const candidate = createCandidate(fallbackCampaign, 0);
 
             // fallback은 의미 유사도 없이 CPC 가중치만 반영하고 이후 동일한 예산 예약 경로를 탄다.
             return [
@@ -129,11 +155,34 @@ export class RTBService {
       this.metricsService.observeRtbMatchedBeforeReserveCount(
         candidates.length
       );
+      this.queueCircuitBreaker.assertAvailable();
 
-      const result =
-        this.budgetMode === 'winner_only'
-          ? await this.runWinnerOnlyReservation(auctionId, blogId, candidates)
-          : await this.runLegacyTopKReservation(auctionId, candidates);
+      let result: SelectionResult;
+      if (this.budgetMode === 'winner_only') {
+        try {
+          result = await this.runWinnerOnlyReservation(
+            auctionId,
+            blogId,
+            candidates
+          );
+        } catch (error) {
+          if (!(error instanceof CampaignVersionMismatchError)) throw error;
+          this.metricsService.incRtbReservationFailure('version_mismatch');
+          candidates = await this.measureStage('version_rematch', () =>
+            this.matcher.matchCandidates(context)
+          );
+          if (candidates.length === 0) {
+            throw new Error('버전 갱신 후 매칭 가능한 캠페인이 없습니다');
+          }
+          result = await this.runWinnerOnlyReservation(
+            auctionId,
+            blogId,
+            candidates
+          );
+        }
+      } else {
+        result = await this.runLegacyTopKReservation(auctionId, candidates);
+      }
 
       // [4. legacy 경매 결과 캐시 저장]
       // winner_only는 예약 Lua가 같은 auction 키에 versioned 예약 정보를 이미 저장한다.
@@ -171,7 +220,28 @@ export class RTBService {
       };
 
       this.metricsService.observeRtbBidLogCount(bidLogJob.items.length);
-      await this.bidlogQueue.add('save-bidlog', bidLogJob);
+      try {
+        await this.queueCircuitBreaker.execute(() =>
+          this.bidlogQueue.add('save-bidlog', bidLogJob, {
+            jobId: `bidlog-${auctionId}`,
+          })
+        );
+      } catch (error) {
+        if (this.budgetMode === 'winner_only') {
+          try {
+            await this.budgetRepository.releaseAuction(
+              auctionId,
+              this.auctionTerminalTtlSeconds
+            );
+          } catch (releaseError) {
+            this.logger.error(
+              `BidLog enqueue 실패 후 예약 해제 실패: ${auctionId}`,
+              releaseError
+            );
+          }
+        }
+        throw error;
+      }
 
       // [6. 성공 결과 분류]
       // fallback 캠페인이 낙찰돼도 API 응답은 success이며 메트릭 결과만 fallback으로 구분한다.
@@ -308,10 +378,7 @@ export class RTBService {
         const dependencyStartedAt = process.hrtime.bigint();
 
         try {
-          await this.campaignCacheRepository.decrementSpent(
-            loser.id,
-            loser.maxCpc
-          );
+          await this.budgetRepository.decrementSpent(loser.id, loser.maxCpc);
           this.metricsService.recordDependency(
             'redis',
             'decrement_spent',
@@ -352,10 +419,7 @@ export class RTBService {
       candidates.map(async (candidate) => {
         const { id, maxCpc } = candidate;
         const dependencyStartedAt = process.hrtime.bigint();
-        const reserved = await this.campaignCacheRepository.incrementSpent(
-          id,
-          maxCpc
-        );
+        const reserved = await this.budgetRepository.incrementSpent(id, maxCpc);
 
         this.metricsService.recordDependency(
           'redis',
@@ -402,14 +466,15 @@ export class RTBService {
 
       // [2-1. 현재 window 예약]
       // Redis가 전달된 순서대로 검사하고 예산 확보가 가능한 첫 캠페인 하나만 예약한다.
-      const reserved = await this.campaignCacheRepository.reserveAuction({
+      const reserved = await this.budgetRepository.reserveAuction({
         auctionId,
         blogId,
         budgetDate,
         expiresAt,
         candidates: window.map((candidate) => ({
           campaignId: candidate.id,
-          cpc: candidate.maxCpc,
+          servingVersion: candidate.servingVersion,
+          ...(this.splitRedisTopology ? {} : { cpc: candidate.maxCpc }),
         })),
       });
       const checkedInWindow = reserved.attemptedCount;
@@ -457,6 +522,11 @@ export class RTBService {
       if (reserved.outcome === 'conflict') {
         throw new Error('auctionId가 기존 legacy 경매 데이터와 충돌했습니다');
       }
+      if (reserved.outcome === 'version_mismatch') {
+        throw new CampaignVersionMismatchError(
+          `Search/Budget 캠페인 버전 불일치: ${reserved.versionMismatchCount ?? 0}건`
+        );
+      }
     }
 
     // [종료 분기: 전체 후보 소진]
@@ -466,6 +536,25 @@ export class RTBService {
       0
     );
     return null;
+  }
+
+  private async findFallbackCampaign() {
+    try {
+      const campaign = await this.measureDependency(
+        'redis',
+        'find_fallback_campaign',
+        () => this.searchRepository.findCampaignById(this.FALLBACK_CAMPAIGN_ID)
+      );
+      return campaign ? toServingCampaign(campaign) : null;
+    } catch (error) {
+      if (!this.campaignServingSnapshot) throw error;
+      const [campaign] = await this.campaignServingSnapshot.findCampaignsByIds([
+        this.FALLBACK_CAMPAIGN_ID,
+      ]);
+      if (!campaign) throw error;
+      this.logger.warn('Fallback 캠페인을 로컬 COW 스냅샷에서 조회했습니다.');
+      return campaign;
+    }
   }
 
   private recordWinnerOnlyFanout(

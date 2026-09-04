@@ -1,6 +1,6 @@
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
-import { Logger, OnApplicationBootstrap } from '@nestjs/common';
+import { Logger, OnApplicationBootstrap, Optional } from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
 import { MLEngine } from 'src/rtb/ml/mlEngine.interface';
 import { CampaignCacheRepository } from 'src/campaign/repository/campaign.cache.repository.interface';
@@ -9,6 +9,8 @@ import type { ContextEmbeddingJobData } from 'src/queue/types/queue.type';
 import { MetricsService } from 'src/metrics/metrics.service';
 import { buildCampaignDocumentText } from 'src/rtb/ml/embedding-text';
 import { EMBEDDING_QUEUE_NAME } from 'src/queue/queue.names';
+import { CampaignSearchRepository } from 'src/campaign/repository/campaign-search.repository.interface';
+import type { CampaignEmbeddingJobData } from 'src/queue/types/queue.type';
 
 @Processor(EMBEDDING_QUEUE_NAME, { autorun: false })
 export class EmbeddingWorker
@@ -22,7 +24,9 @@ export class EmbeddingWorker
     private readonly mlEngine: MLEngine,
     private readonly campaignCacheRepository: CampaignCacheRepository,
     private readonly contextEmbeddingService: ContextEmbeddingService,
-    private readonly metricsService: MetricsService
+    private readonly metricsService: MetricsService,
+    @Optional()
+    private readonly campaignSearchRepository?: CampaignSearchRepository
   ) {
     super();
   }
@@ -55,16 +59,14 @@ export class EmbeddingWorker
 
     try {
       if (job.name === 'generate-campaign-embedding') {
-        const { campaignId, modelVersion } = job.data as {
-          campaignId: string;
-          modelVersion?: string;
-        };
+        const campaignJob = job.data as CampaignEmbeddingJobData;
+        const { modelVersion } = campaignJob;
         if (modelVersion && modelVersion !== this.mlEngine.getModelVersion()) {
           throw new Error(
             `campaign job model version 불일치: ${modelVersion} vs ${this.mlEngine.getModelVersion()}`
           );
         }
-        await this.generateCampaignEmbedding(campaignId);
+        await this.generateCampaignEmbedding(campaignJob);
       } else if (job.name === 'generate-context-embedding') {
         await this.generateContextEmbedding(
           job as Job<ContextEmbeddingJobData>
@@ -120,18 +122,31 @@ export class EmbeddingWorker
     }
   }
 
-  private async generateCampaignEmbedding(campaignId: string) {
-    // 1. Redis에서 캠페인 정보 조회 (태그 정보 필요)
-    const campaign =
-      await this.campaignCacheRepository.findCampaignCacheById(campaignId);
+  private async generateCampaignEmbedding(job: CampaignEmbeddingJobData) {
+    const versioned =
+      job.servingVersion !== undefined &&
+      job.semanticHash !== undefined &&
+      job.title !== undefined &&
+      job.content !== undefined &&
+      job.tags !== undefined;
+    const campaign = versioned
+      ? {
+          id: job.campaignId,
+          title: job.title!,
+          content: job.content!,
+          tags: job.tags!,
+        }
+      : await this.campaignCacheRepository.findCampaignCacheById(
+          job.campaignId
+        );
 
     if (!campaign) {
-      this.logger.warn(`Campaign ${campaignId}를 찾을 수 없습니다.`);
+      this.logger.warn(`Campaign ${job.campaignId}를 찾을 수 없습니다.`);
       return;
     }
 
     if (!campaign.tags || campaign.tags.length === 0) {
-      this.logger.warn(`Campaign ${campaignId}에 태그가 없습니다.`);
+      this.logger.warn(`Campaign ${job.campaignId}에 태그가 없습니다.`);
       return;
     }
 
@@ -149,14 +164,38 @@ export class EmbeddingWorker
     );
 
     // 3. model version, document, tag vector를 한 번에 publish한다.
-    await this.campaignCacheRepository.updateCampaignEmbeddings(campaignId, {
+    const payload = {
       modelVersion: this.mlEngine.getModelVersion(),
       document,
       tags: embeddingTags,
-    });
+    };
+
+    if (versioned) {
+      if (!this.campaignSearchRepository) {
+        throw new Error('versioned embedding용 Search repository가 없습니다');
+      }
+      const applied =
+        await this.campaignSearchRepository.updateEmbeddingsIfCurrent(
+          job.campaignId,
+          job.servingVersion!,
+          job.semanticHash!,
+          payload
+        );
+      if (!applied) {
+        this.logger.warn(
+          `stale campaign embedding 폐기: ${job.campaignId} v${job.servingVersion}`
+        );
+        return;
+      }
+    } else {
+      await this.campaignCacheRepository.updateCampaignEmbeddings(
+        job.campaignId,
+        payload
+      );
+    }
 
     this.logger.log(
-      `✅ ID:${campaignId.slice(0, 8)}... title:${campaign.title.slice(0, 15)}... 임베딩 생성 완료 (${campaign.tags.length}개 태그)`
+      `✅ ID:${job.campaignId.slice(0, 8)}... title:${campaign.title.slice(0, 15)}... 임베딩 생성 완료 (${campaign.tags.length}개 태그)`
     );
   }
 }

@@ -12,6 +12,7 @@ export function createCandidate(
   return {
     id: campaign.id,
     userId: campaign.userId,
+    servingVersion: campaign.servingVersion,
     title: campaign.title,
     content: campaign.content,
     image: campaign.image,

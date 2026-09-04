@@ -1,7 +1,7 @@
 import { ConflictException } from '@nestjs/common';
 import { LoadtestService } from './loadtest.service';
 import { ConfigService } from '@nestjs/config';
-import { CampaignCacheRepository } from 'src/campaign/repository/campaign.cache.repository.interface';
+import type { CampaignBudgetRepository } from 'src/campaign/repository/campaign-budget.repository.interface';
 import { CampaignEntity } from 'src/campaign/entities/campaign.entity';
 import { BidLogEntity } from 'src/bid-log/entities/bid-log.entity';
 import { ViewLogEntity } from 'src/log/entities/view-log.entity';
@@ -18,9 +18,8 @@ describe('LoadtestService', () => {
     scan: jest.Mock;
     del: jest.Mock;
   };
-  let campaignCacheRepository: {
-    findCampaignCacheById: jest.Mock;
-    saveCampaignCacheById: jest.Mock;
+  let campaignBudgetRepository: {
+    resetForLoadTest: jest.Mock;
   };
   let bidlogQueue: {
     getJobCounts: jest.Mock;
@@ -91,28 +90,8 @@ describe('LoadtestService', () => {
       del: jest.fn().mockResolvedValue(0),
     };
 
-    campaignCacheRepository = {
-      findCampaignCacheById: jest.fn().mockResolvedValue({
-        id: 'campaign-1',
-        userId: 1,
-        title: 'Test',
-        content: 'Test',
-        image: null,
-        url: 'https://example.com',
-        maxCpc: 100,
-        dailyBudget: 1000,
-        totalBudget: 10000,
-        dailySpent: 300,
-        totalSpent: 500,
-        lastResetDate: '2026-03-07T00:00:00.000Z',
-        isHighIntent: false,
-        status: 'ACTIVE',
-        startDate: '2026-03-07T00:00:00.000Z',
-        endDate: '2026-03-08T00:00:00.000Z',
-        createdAt: '2026-03-07T00:00:00.000Z',
-        deletedAt: null,
-      }),
-      saveCampaignCacheById: jest.fn().mockResolvedValue(undefined),
+    campaignBudgetRepository = {
+      resetForLoadTest: jest.fn().mockResolvedValue(true),
     };
 
     bidlogQueue = {
@@ -132,7 +111,7 @@ describe('LoadtestService', () => {
       configService as unknown as ConfigService,
       dataSource as never,
       ioRedisClient as never,
-      campaignCacheRepository as unknown as CampaignCacheRepository,
+      campaignBudgetRepository as unknown as CampaignBudgetRepository,
       bidlogQueue as never
     );
   });
@@ -145,16 +124,8 @@ describe('LoadtestService', () => {
     expect(result.counts.deletedClickLogs).toBe(1);
     expect(result.counts.deletedViewLogs).toBe(1);
     expect(result.counts.deletedBidLogs).toBe(2);
-    expect(campaignCacheRepository.saveCampaignCacheById).toHaveBeenCalledWith(
-      'campaign-1',
-      expect.objectContaining({
-        dailySpent: 0,
-        totalSpent: 0,
-        dailyReserved: 0,
-        totalReserved: 0,
-      }),
-      undefined,
-      { preserveReservation: false }
+    expect(campaignBudgetRepository.resetForLoadTest).toHaveBeenCalledWith(
+      'campaign-1'
     );
   });
 

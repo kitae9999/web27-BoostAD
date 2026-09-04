@@ -22,10 +22,13 @@ import type {
   AuctionReservationRecord,
 } from 'src/campaign/types/campaign.types';
 import type { SaveViewLog } from 'src/log/types/log.type';
+import { CampaignBudgetRepository } from 'src/campaign/repository/campaign-budget.repository.interface';
+import { Optional } from '@nestjs/common';
 
 @Injectable()
 export class SdkService {
   private readonly logger = new Logger(SdkService.name);
+  private readonly budgetRepository: CampaignBudgetRepository;
 
   constructor(
     private readonly logRepository: LogRepository,
@@ -34,8 +37,12 @@ export class SdkService {
     private readonly campaignRepository: CampaignRepository,
     private readonly blogRepository: BlogRepository,
     private readonly userRepository: UserRepository,
-    private readonly configService: ConfigService
+    private readonly configService: ConfigService,
+    @Optional() budgetRepository?: CampaignBudgetRepository
   ) {
+    this.budgetRepository =
+      budgetRepository ??
+      (campaignCacheRepository as unknown as CampaignBudgetRepository);
     this.auctionTerminalTtlSeconds = this.getPositiveIntConfig(
       'RTB_AUCTION_TERMINAL_TTL_SECONDS',
       AUCTION_TERMINAL_TTL_SECONDS
@@ -55,7 +62,7 @@ export class SdkService {
     } = dto;
 
     const reservation =
-      await this.campaignCacheRepository.getAuctionReservation(auctionId);
+      await this.budgetRepository.getAuctionReservation(auctionId);
     if (reservation) {
       return this.recordReservedView(dto, visitorId, reservation);
     }
@@ -164,10 +171,9 @@ export class SdkService {
       throw new BadRequestException('잘못된 요청입니다.');
     }
 
-    const reservation =
-      await this.campaignCacheRepository.getAuctionReservation(
-        viewLog.auctionId
-      );
+    const reservation = await this.budgetRepository.getAuctionReservation(
+      viewLog.auctionId
+    );
     if (reservation) {
       return this.recordReservedClick(viewId, viewLog);
     }
@@ -199,12 +205,11 @@ export class SdkService {
 
     const viewLog = await this.logRepository.getViewLog(viewId);
     if (viewLog) {
-      const reservation =
-        await this.campaignCacheRepository.getAuctionReservation(
-          viewLog.auctionId
-        );
+      const reservation = await this.budgetRepository.getAuctionReservation(
+        viewLog.auctionId
+      );
       if (reservation) {
-        const transition = await this.campaignCacheRepository.releaseAuction(
+        const transition = await this.budgetRepository.releaseAuction(
           viewLog.auctionId,
           this.auctionTerminalTtlSeconds
         );
@@ -233,7 +238,7 @@ export class SdkService {
     );
 
     // 2. Spent 롤백 (Phase 2에서 구현된 메서드 사용)
-    await this.campaignCacheRepository.decrementSpent(campaignId, cost);
+    await this.budgetRepository.decrementSpent(campaignId, cost);
 
     // 3. Redis에서 Rollback 정보 + 백업 삭제 (중복 방지)
     await this.cacheRepository.deleteRollbackInfo(viewId);
@@ -253,7 +258,7 @@ export class SdkService {
       throw new NotFoundException('404 not found');
     }
     if (reservation.expiresAt <= Date.now()) {
-      await this.campaignCacheRepository.releaseAuction(
+      await this.budgetRepository.releaseAuction(
         reservation.auctionId,
         this.auctionTerminalTtlSeconds
       );
@@ -303,7 +308,7 @@ export class SdkService {
     viewId: number,
     viewLog: SaveViewLog
   ): Promise<number | null> {
-    const transition = await this.campaignCacheRepository.commitAuction(
+    const transition = await this.budgetRepository.commitAuction(
       viewLog.auctionId,
       this.getKstBudgetDate(Date.now()),
       this.auctionTerminalTtlSeconds

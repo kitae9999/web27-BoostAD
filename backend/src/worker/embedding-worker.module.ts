@@ -10,6 +10,7 @@ import { ContextEmbeddingService } from 'src/rtb/context/context-embedding.servi
 import { MLEngine } from 'src/rtb/ml/mlEngine.interface';
 import { XenovaMLEngine } from 'src/rtb/ml/xenova-mlEngine';
 import { EmbeddingWorker } from './embedding.worker';
+import { CampaignSearchRepository } from 'src/campaign/repository/campaign-search.repository.interface';
 
 @Module({
   imports: [
@@ -23,9 +24,14 @@ import { EmbeddingWorker } from './embedding.worker';
     EmbeddingWorker,
     ContextEmbeddingService,
     { provide: MLEngine, useClass: XenovaMLEngine },
+    RedisCampaignCacheRepository,
     {
       provide: CampaignCacheRepository,
-      useClass: RedisCampaignCacheRepository,
+      useExisting: RedisCampaignCacheRepository,
+    },
+    {
+      provide: CampaignSearchRepository,
+      useExisting: RedisCampaignCacheRepository,
     },
   ],
 })

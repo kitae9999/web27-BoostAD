@@ -11,9 +11,9 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { Queue } from 'bullmq';
 import { DataSource, In } from 'typeorm';
-import { IOREDIS_CLIENT } from 'src/redis/redis.constant';
+import { BUDGET_REDIS_CLIENT } from 'src/redis/redis.constant';
 import type { AppIORedisClient } from 'src/redis/redis.type';
-import { CampaignCacheRepository } from 'src/campaign/repository/campaign.cache.repository.interface';
+import { CampaignBudgetRepository } from 'src/campaign/repository/campaign-budget.repository.interface';
 import { CampaignEntity } from 'src/campaign/entities/campaign.entity';
 import { ViewLogEntity } from 'src/log/entities/view-log.entity';
 import { ClickLogEntity } from 'src/log/entities/click-log.entity';
@@ -54,9 +54,9 @@ export class LoadtestService {
   constructor(
     private readonly configService: ConfigService,
     @InjectDataSource() private readonly dataSource: DataSource,
-    @Inject(IOREDIS_CLIENT) private readonly ioRedisClient: AppIORedisClient,
-    @Inject(CampaignCacheRepository)
-    private readonly campaignCacheRepository: CampaignCacheRepository,
+    @Inject(BUDGET_REDIS_CLIENT)
+    private readonly ioRedisClient: AppIORedisClient,
+    private readonly campaignBudgetRepository: CampaignBudgetRepository,
     @InjectQueue('bidlog-queue')
     private readonly bidlogQueue: Queue
   ) {}
@@ -95,9 +95,8 @@ export class LoadtestService {
       options.clearLogs
     );
 
-    counts.redisCampaignsReset = await this.resetRedisCampaignState(
-      scopedCampaignIds
-    );
+    counts.redisCampaignsReset =
+      await this.resetRedisCampaignState(scopedCampaignIds);
     counts.drainedBidlogJobs = drainedBidlogJobs;
 
     if (options.clearAuxRedisKeys) {
@@ -123,7 +122,9 @@ export class LoadtestService {
       );
     }
 
-    const expectedToken = this.configService.get<string>('LOADTEST_RESET_TOKEN');
+    const expectedToken = this.configService.get<string>(
+      'LOADTEST_RESET_TOKEN'
+    );
     if (!expectedToken) {
       throw new ServiceUnavailableException(
         'LOADTEST_RESET_TOKEN이 설정되지 않아 reset endpoint를 사용할 수 없습니다.'
@@ -131,7 +132,9 @@ export class LoadtestService {
     }
 
     if (!providedToken || providedToken !== expectedToken) {
-      throw new UnauthorizedException('유효한 loadtest reset token이 필요합니다.');
+      throw new UnauthorizedException(
+        '유효한 loadtest reset token이 필요합니다.'
+      );
     }
   }
 
@@ -244,35 +247,15 @@ export class LoadtestService {
     });
   }
 
-  private async resetRedisCampaignState(campaignIds: string[]): Promise<number> {
+  private async resetRedisCampaignState(
+    campaignIds: string[]
+  ): Promise<number> {
     let resetCount = 0;
-    const resetTimestamp = new Date().toISOString();
 
     for (const campaignId of campaignIds) {
-      const cached =
-        await this.campaignCacheRepository.findCampaignCacheById(campaignId);
-
-      if (!cached) {
-        continue;
+      if (await this.campaignBudgetRepository.resetForLoadTest(campaignId)) {
+        resetCount += 1;
       }
-
-      await this.campaignCacheRepository.saveCampaignCacheById(
-        campaignId,
-        {
-          ...cached,
-          dailySpent: 0,
-          totalSpent: 0,
-          dailyReserved: 0,
-          totalReserved: 0,
-          dailyReservedDate: new Date(Date.now() + 9 * 60 * 60 * 1000)
-            .toISOString()
-            .slice(0, 10),
-          lastResetDate: resetTimestamp,
-        },
-        undefined,
-        { preserveReservation: false }
-      );
-      resetCount += 1;
     }
 
     return resetCount;

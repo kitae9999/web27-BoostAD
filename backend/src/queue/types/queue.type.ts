@@ -4,6 +4,11 @@ import { BidStatus } from '../../bid-log/bid-log.types';
 export interface CampaignEmbeddingJobData {
   campaignId: string;
   modelVersion?: string;
+  servingVersion?: number;
+  semanticHash?: string;
+  title?: string;
+  content?: string;
+  tags?: string[];
   text?: string; // 더 이상 사용하지 않음 (하위 호환성 유지)
 }
 

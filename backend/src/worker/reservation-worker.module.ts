@@ -7,6 +7,7 @@ import { CampaignCacheRepository } from 'src/campaign/repository/campaign.cache.
 import { RedisCampaignCacheRepository } from 'src/campaign/repository/redis-campaign.cache.repository';
 import { RedisModule } from 'src/redis/redis.module';
 import { RedisTTLWorker } from './redis-ttl.worker';
+import { CampaignBudgetRepository } from 'src/campaign/repository/campaign-budget.repository.interface';
 
 @Module({
   imports: [
@@ -16,9 +17,14 @@ import { RedisTTLWorker } from './redis-ttl.worker';
   ],
   providers: [
     RedisTTLWorker,
+    RedisCampaignCacheRepository,
     {
       provide: CampaignCacheRepository,
-      useClass: RedisCampaignCacheRepository,
+      useExisting: RedisCampaignCacheRepository,
+    },
+    {
+      provide: CampaignBudgetRepository,
+      useExisting: RedisCampaignCacheRepository,
     },
     {
       provide: CacheRepository,

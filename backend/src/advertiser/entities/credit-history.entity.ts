@@ -49,6 +49,16 @@ export class CreditHistoryEntity {
   campaignId: string | null;
 
   @Column({
+    name: 'operation_key',
+    type: 'varchar',
+    length: 255,
+    nullable: true,
+    unique: true,
+    comment: '비동기 정산의 exactly-once idempotency key',
+  })
+  operationKey: string | null;
+
+  @Column({
     type: 'varchar',
     length: 255,
     nullable: true,

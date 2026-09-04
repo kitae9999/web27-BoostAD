@@ -8,6 +8,7 @@ describe('CampaignService initial cache loading', () => {
   const campaign: CampaignWithTags = {
     id: 'campaign-1',
     userId: 1,
+    servingVersion: 1,
     title: 'campaign',
     content: 'content',
     image: null,

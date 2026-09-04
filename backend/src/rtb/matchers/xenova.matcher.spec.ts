@@ -19,6 +19,7 @@ describe('TransformerMatcher ANN path', () => {
   ): CachedCampaign => ({
     id,
     userId: 1,
+    servingVersion: 1,
     title: `campaign-${id}`,
     content: 'content',
     image: null,
@@ -330,6 +331,46 @@ describe('TransformerMatcher ANN path', () => {
     expect(candidates.map((candidate) => candidate.similarity)).toEqual([
       0.9, 0.4,
     ]);
+  });
+
+  it('rejects an ANN hit whose campaign version differs from hydration', async () => {
+    const current = {
+      ...buildCampaign('c1', ['typescript'], { typescript: [1, 0] }),
+      servingVersion: 2,
+      indexReady: true,
+      embeddingDocument: [0.4, 0.6],
+    };
+    const repository = buildRepository([current]);
+    repository.searchCampaignDocumentVectors.mockResolvedValue([
+      {
+        campaignId: 'c1',
+        servingVersion: 1,
+        distance: 0.1,
+        similarity: 0.9,
+      },
+    ]);
+    const matcher = buildMatcher(
+      repository,
+      buildSnapshot([current]),
+      buildMlEngine(),
+      buildMetricsService(),
+      buildProductDefaultConfigService({
+        RTB_MATCHER_ANN_ENABLED: 'true',
+        RTB_CAMPAIGN_SOURCE: 'local_snapshot',
+      })
+    );
+
+    await expect(
+      matcher.matchCandidates({
+        blogKey: 'blog',
+        blogId: 1,
+        blogName: 'blog',
+        tags: ['typescript'],
+        postUrl: 'https://example.com/post',
+        behaviorScore: 50,
+        isHighIntent: false,
+      })
+    ).resolves.toEqual([]);
   });
 
   it('returns the real hybrid reserve candidates when RTB_RETRIEVAL_MODE=hybrid', async () => {
@@ -1109,6 +1150,44 @@ describe('TransformerMatcher ANN path', () => {
       'ok',
       expect.any(Number)
     );
+  });
+
+  it('falls back to the local lexical snapshot when Search Redis ANN fails', async () => {
+    const campaign = buildCampaign('c1', ['typescript'], {
+      typescript: [1, 0],
+    });
+    const repository = buildRepository([campaign]);
+    repository.searchCampaignTagVectors.mockRejectedValue(
+      new Error('search unavailable')
+    );
+    const metrics = buildMetricsService();
+    const matcher = buildMatcher(
+      repository,
+      buildSnapshot([campaign]),
+      buildMlEngine(),
+      metrics,
+      buildConfigService({
+        RTB_MATCHER_ANN_ENABLED: 'true',
+        RTB_CAMPAIGN_SOURCE: 'local_snapshot',
+      })
+    );
+
+    const candidates = await matcher.matchCandidates({
+      blogKey: 'blog',
+      blogId: 1,
+      blogName: 'blog',
+      tags: ['typescript'],
+      postUrl: 'https://example.com/post',
+      behaviorScore: 20,
+      isHighIntent: false,
+    });
+
+    expect(candidates.map((candidate) => candidate.id)).toEqual(['c1']);
+    expect(
+      (metrics as unknown as { recordRtbLexicalFallback: jest.Mock })
+        .recordRtbLexicalFallback
+    ).toHaveBeenCalledWith('search_unavailable', 1);
+    expect(repository.findCampaignCachesByIds).not.toHaveBeenCalled();
   });
 
   it('keeps candidate ranking identical between Redis and snapshot hydration', async () => {

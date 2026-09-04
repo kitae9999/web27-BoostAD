@@ -3,6 +3,7 @@ export type CampaignStatus = 'PENDING' | 'ACTIVE' | 'PAUSED' | 'ENDED';
 export type Campaign = {
   id: string;
   userId: number;
+  servingVersion: number;
   title: string;
   content: string;
   image: string;
@@ -46,6 +47,9 @@ export type CampaignTag = {
 export type CachedCampaign = {
   id: string;
   userId: number;
+  servingVersion: number;
+  semanticHash?: string;
+  indexReady?: boolean;
   title: string;
   content: string;
   image: string | null;
@@ -81,6 +85,33 @@ export type CachedCampaign = {
   embeddingDocument?: number[];
 };
 
+/**
+ * Search Redis에 저장하는 campaign projection. 입찰 순위에 필요한 maxCpc는
+ * 포함하지만 예산 한도·spent·reservation 상태는 Budget Redis에만 둔다.
+ */
+export type SearchCampaign = {
+  id: string;
+  userId: number;
+  servingVersion: number;
+  semanticHash: string;
+  indexReady: boolean;
+  title: string;
+  content: string;
+  image: string | null;
+  url: string;
+  maxCpc: number;
+  isHighIntent: boolean;
+  status: CampaignStatus;
+  startDate: string;
+  endDate: string;
+  createdAt: string;
+  deletedAt: string | null;
+  tags: string[];
+  embeddingTags?: { [tagName: string]: number[] };
+  embeddingModelVersion?: string;
+  embeddingDocument?: number[];
+};
+
 export type CampaignEmbeddingPayload = {
   modelVersion: string;
   document: number[];
@@ -105,6 +136,7 @@ export type CampaignTagVectorSearchOptions = {
 
 export type CampaignTagVectorSearchHit = {
   campaignId: string;
+  servingVersion: number;
   tagName: string;
   distance: number;
   similarity: number;
@@ -112,22 +144,22 @@ export type CampaignTagVectorSearchHit = {
 
 export type CampaignDocumentVectorSearchHit = {
   campaignId: string;
+  servingVersion: number;
   distance: number;
   similarity: number;
 };
 
 export type BudgetReservationCandidate = {
   campaignId: string;
-  cpc: number;
+  servingVersion: number;
+  // legacy topology의 RedisJSON 예약 Lua에만 전달한다. split topology에서는
+  // Budget Redis의 maxCpc가 권위값이며 이 값은 Lua 인자로 전달하지 않는다.
+  cpc?: number;
 };
 
-export type AuctionReservationStatus =
-  | 'RESERVED'
-  | 'COMMITTED'
-  | 'RELEASED';
+export type AuctionReservationStatus = 'RESERVED' | 'COMMITTED' | 'RELEASED';
 
-export type ActiveAuctionReservation = {
-  version: 1;
+type AuctionReservationBase = {
   auctionId: string;
   campaignId: string;
   blogId: number;
@@ -139,8 +171,21 @@ export type ActiveAuctionReservation = {
   expiresAt: number;
 };
 
-export type AuctionTerminalMarker = {
+export type LegacyActiveAuctionReservation = AuctionReservationBase & {
   version: 1;
+};
+
+export type VersionedActiveAuctionReservation = AuctionReservationBase & {
+  version: 2;
+  campaignServingVersion: number;
+};
+
+export type ActiveAuctionReservation =
+  | LegacyActiveAuctionReservation
+  | VersionedActiveAuctionReservation;
+
+export type AuctionTerminalMarker = {
+  version: 1 | 2;
   auctionId: string;
   status: Exclude<AuctionReservationStatus, 'RESERVED'>;
   updatedAt: number;
@@ -159,9 +204,15 @@ export type ReserveAuctionRequest = {
 };
 
 export type ReserveAuctionResult = {
-  outcome: 'reserved' | 'existing' | 'conflict' | 'exhausted';
+  outcome:
+    | 'reserved'
+    | 'existing'
+    | 'conflict'
+    | 'version_mismatch'
+    | 'exhausted';
   reservation?: AuctionReservationRecord;
   attemptedCount: number;
+  versionMismatchCount?: number;
 };
 
 export type AuctionTransitionResult = {

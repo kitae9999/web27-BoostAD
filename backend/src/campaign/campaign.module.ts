@@ -19,6 +19,11 @@ import { UserModule } from 'src/user/user.module';
 import { RedisModule } from 'src/redis/redis.module';
 import { QueueModule } from 'src/queue/queue.module';
 import { CampaignServingSnapshotService } from './campaign-serving-snapshot.service';
+import { CampaignSearchRepository } from './repository/campaign-search.repository.interface';
+import { CampaignBudgetRepository } from './repository/campaign-budget.repository.interface';
+import { CampaignProjectionOutboxEntity } from './projection/entities/campaign-projection-outbox.entity';
+import { CampaignProjectionOutboxWriter } from './projection/campaign-projection-outbox.writer';
+import { CampaignProjectionCommandService } from './projection/campaign-projection-command.service';
 
 @Module({
   imports: [
@@ -27,6 +32,7 @@ import { CampaignServingSnapshotService } from './campaign-serving-snapshot.serv
       TagEntity,
       UserEntity,
       CreditHistoryEntity,
+      CampaignProjectionOutboxEntity,
     ]),
     LogModule,
     ImageModule,
@@ -40,15 +46,28 @@ import { CampaignServingSnapshotService } from './campaign-serving-snapshot.serv
     CampaignService,
     CampaignCronService,
     CampaignServingSnapshotService,
+    CampaignProjectionOutboxWriter,
+    CampaignProjectionCommandService,
+    RedisCampaignCacheRepository,
     { provide: CampaignRepository, useClass: TypeOrmCampaignRepository },
     {
       provide: CampaignCacheRepository,
-      useClass: RedisCampaignCacheRepository,
+      useExisting: RedisCampaignCacheRepository,
+    },
+    {
+      provide: CampaignSearchRepository,
+      useExisting: RedisCampaignCacheRepository,
+    },
+    {
+      provide: CampaignBudgetRepository,
+      useExisting: RedisCampaignCacheRepository,
     },
   ],
   exports: [
     CampaignRepository,
     CampaignCacheRepository,
+    CampaignSearchRepository,
+    CampaignBudgetRepository,
     CampaignServingSnapshotService,
   ],
 })

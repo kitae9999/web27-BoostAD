@@ -419,6 +419,7 @@ export class QualityBenchmarkService {
     return {
       id: input.campaignKey,
       userId: 0,
+      servingVersion: 1,
       title: input.title,
       content: input.content,
       image: null,

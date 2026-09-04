@@ -79,6 +79,7 @@ export class TypeOrmCampaignRepository extends CampaignRepository {
     const campaign = this.campaignRepo.create({
       id: randomUUID(),
       userId,
+      servingVersion: 1,
       title: dto.title,
       content: dto.content,
       image: dto.image,
@@ -260,6 +261,7 @@ export class TypeOrmCampaignRepository extends CampaignRepository {
     return {
       id: entity.id,
       userId: entity.userId,
+      servingVersion: Number(entity.servingVersion),
       title: entity.title,
       content: entity.content,
       image: entity.image,

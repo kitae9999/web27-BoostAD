@@ -10,9 +10,10 @@ import { UserRepository } from '../user/repository/user.repository.interface';
 import { SdkService } from './sdk.service';
 
 const reservation: ActiveAuctionReservation = {
-  version: 1,
+  version: 2,
   auctionId: 'auction-1',
   campaignId: 'campaign-1',
+  campaignServingVersion: 1,
   blogId: 7,
   cost: 100,
   status: 'RESERVED',

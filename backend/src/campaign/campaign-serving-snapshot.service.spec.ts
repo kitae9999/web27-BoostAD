@@ -2,6 +2,8 @@ import { CampaignServingSnapshotService } from './campaign-serving-snapshot.serv
 import { CampaignCacheRepository } from './repository/campaign.cache.repository.interface';
 import type { CachedCampaign } from './types/campaign.types';
 import { ConfigService } from '@nestjs/config';
+import type { AppIORedisClient } from '../redis/redis.type';
+import type { CampaignSearchRepository } from './repository/campaign-search.repository.interface';
 
 describe('CampaignServingSnapshotService', () => {
   const embedding = Array.from({ length: 384 }, (_, index) => index / 384);
@@ -12,6 +14,7 @@ describe('CampaignServingSnapshotService', () => {
   ): CachedCampaign => ({
     id,
     userId: 1,
+    servingVersion: 1,
     title: id,
     content: 'content',
     image: null,
@@ -140,6 +143,21 @@ describe('CampaignServingSnapshotService', () => {
     expect(campaigns[0].embeddingTags?.tag).toBeInstanceOf(Float32Array);
   });
 
+  it('does not admit an index-unready repair into the safe snapshot', async () => {
+    const incomplete = {
+      ...buildCampaign('c1', {}),
+      indexReady: false,
+    };
+    const repository = buildRepository([incomplete]);
+    const service = new CampaignServingSnapshotService(
+      repository,
+      configService
+    );
+
+    await expect(service.findCampaignsByIds(['c1'])).resolves.toEqual([]);
+    await expect(service.findCampaignsByTags(['tag'])).resolves.toEqual([]);
+  });
+
   it('applies cache mutations without rebuilding the whole snapshot', async () => {
     const first = buildCampaign('c1');
     const second = buildCampaign('c2');
@@ -166,8 +184,16 @@ describe('CampaignServingSnapshotService', () => {
   });
 
   it('serves normalized tag unions from the local inverted index', async () => {
-    const first = { ...buildCampaign('c1'), tags: ['React', 'TypeScript'] };
-    const second = { ...buildCampaign('c2'), tags: ['Redis'] };
+    const first = {
+      ...buildCampaign('c1'),
+      tags: ['React', 'TypeScript'],
+      embeddingTags: { React: embedding, TypeScript: embedding },
+    };
+    const second = {
+      ...buildCampaign('c2'),
+      tags: ['Redis'],
+      embeddingTags: { Redis: embedding },
+    };
     const repository = buildRepository([first, second]);
     const service = new CampaignServingSnapshotService(
       repository,
@@ -186,8 +212,16 @@ describe('CampaignServingSnapshotService', () => {
   });
 
   it('keeps the tag index synchronized with upsert and remove events', async () => {
-    const first = { ...buildCampaign('c1'), tags: ['before'] };
-    const updated = { ...buildCampaign('c1'), tags: ['after'] };
+    const first = {
+      ...buildCampaign('c1'),
+      tags: ['before'],
+      embeddingTags: { before: embedding },
+    };
+    const updated = {
+      ...buildCampaign('c1'),
+      tags: ['after'],
+      embeddingTags: { after: embedding },
+    };
     const repository = buildRepository([first]);
     const service = new CampaignServingSnapshotService(
       repository,
@@ -231,5 +265,262 @@ describe('CampaignServingSnapshotService', () => {
     const campaigns = await readInFlight;
 
     expect(campaigns[0].title).toBe('updated');
+  });
+
+  it('bootstraps from a head, then replays events that arrived during full load', async () => {
+    const initial = { ...buildCampaign('c1'), servingVersion: 1 };
+    const updated = {
+      ...buildCampaign('c1'),
+      servingVersion: 2,
+      title: 'updated-by-stream',
+      indexReady: true,
+    };
+    const legacyRepository = buildRepository([]);
+    const searchRepository = {
+      getAllSearchCampaigns: jest.fn().mockResolvedValue([initial]),
+      findCampaignsByIds: jest.fn().mockResolvedValue([updated]),
+    } as unknown as CampaignSearchRepository;
+    const searchRedis = {
+      xrevrange: jest.fn().mockResolvedValue([['10-0', []]]),
+      xrange: jest
+        .fn()
+        .mockResolvedValueOnce([
+          [
+            '11-0',
+            [
+              'type',
+              'UPSERT',
+              'campaignId',
+              'c1',
+              'servingVersion',
+              '2',
+              'indexReady',
+              '1',
+            ],
+          ],
+        ])
+        .mockResolvedValueOnce([]),
+    } as unknown as AppIORedisClient;
+    const activeConfig = {
+      get: jest.fn((key: string, defaultValue?: string) => {
+        if (key === 'RTB_CAMPAIGN_SOURCE') return 'local_snapshot';
+        if (key === 'RTB_EMBEDDING_PROFILE') return 'legacy_minilm';
+        if (key === 'RTB_DENSE_RETRIEVAL_MODE') return 'legacy_tag';
+        if (key === 'CAMPAIGN_PROJECTION_MODE') return 'active';
+        return defaultValue;
+      }),
+    } as unknown as ConfigService;
+    const service = new CampaignServingSnapshotService(
+      legacyRepository,
+      activeConfig,
+      searchRedis,
+      searchRepository
+    );
+
+    const campaigns = await service.findCampaignsByIds(['c1']);
+
+    expect(campaigns[0]).toMatchObject({
+      servingVersion: 2,
+      title: 'updated-by-stream',
+    });
+    expect(searchRedis.xrevrange).toHaveBeenCalledTimes(1);
+    expect(searchRepository.getAllSearchCampaigns).toHaveBeenCalledTimes(1);
+    expect(searchRepository.findCampaignsByIds).toHaveBeenCalledWith(['c1']);
+  });
+
+  it('does not expose the bootstrap snapshot before Stream replay completes', async () => {
+    const initial = { ...buildCampaign('c1'), servingVersion: 1 };
+    const updated = {
+      ...buildCampaign('c1'),
+      servingVersion: 2,
+      title: 'replayed-before-ready',
+      indexReady: true,
+    };
+    let finishReplay:
+      | ((entries: Array<[string, string[]]>) => void)
+      | undefined;
+    const searchRepository = {
+      getAllSearchCampaigns: jest.fn().mockResolvedValue([initial]),
+      findCampaignsByIds: jest.fn().mockResolvedValue([updated]),
+    } as unknown as CampaignSearchRepository;
+    const searchRedis = {
+      xrevrange: jest.fn().mockResolvedValue([['10-0', []]]),
+      xrange: jest
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise<Array<[string, string[]]>>((resolve) => {
+              finishReplay = resolve;
+            })
+        )
+        .mockResolvedValueOnce([]),
+    } as unknown as AppIORedisClient;
+    const activeConfig = {
+      get: jest.fn((key: string, defaultValue?: string) => {
+        if (key === 'RTB_CAMPAIGN_SOURCE') return 'local_snapshot';
+        if (key === 'RTB_EMBEDDING_PROFILE') return 'legacy_minilm';
+        if (key === 'RTB_DENSE_RETRIEVAL_MODE') return 'legacy_tag';
+        if (key === 'CAMPAIGN_PROJECTION_MODE') return 'active';
+        return defaultValue;
+      }),
+    } as unknown as ConfigService;
+    const service = new CampaignServingSnapshotService(
+      buildRepository([]),
+      activeConfig,
+      searchRedis,
+      searchRepository
+    );
+
+    const firstRead = service.findCampaignsByIds(['c1']);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(finishReplay).toBeDefined();
+    let secondResolved = false;
+    const secondRead = service.findCampaignsByIds(['c1']).then((campaigns) => {
+      secondResolved = true;
+      return campaigns;
+    });
+    await Promise.resolve();
+    expect(secondResolved).toBe(false);
+
+    finishReplay?.([
+      [
+        '11-0',
+        [
+          'type',
+          'UPSERT',
+          'campaignId',
+          'c1',
+          'servingVersion',
+          '2',
+          'indexReady',
+          '1',
+        ],
+      ],
+    ]);
+
+    await expect(firstRead).resolves.toEqual([
+      expect.objectContaining({
+        servingVersion: 2,
+        title: 'replayed-before-ready',
+      }),
+    ]);
+    await expect(secondRead).resolves.toEqual([
+      expect.objectContaining({
+        servingVersion: 2,
+        title: 'replayed-before-ready',
+      }),
+    ]);
+  });
+
+  it('lets each API snapshot apply the same independent Stream event', async () => {
+    const initial = { ...buildCampaign('c1'), servingVersion: 1 };
+    const updated = {
+      ...buildCampaign('c1'),
+      servingVersion: 2,
+      title: 'broadcast-update',
+      indexReady: true,
+    };
+    const eventFields = [
+      'type',
+      'UPSERT',
+      'campaignId',
+      'c1',
+      'servingVersion',
+      '2',
+      'indexReady',
+      '1',
+    ];
+
+    const services = [1, 2].map(() => {
+      const repository = buildRepository([initial]);
+      const searchRepository = {
+        getAllSearchCampaigns: jest.fn().mockResolvedValue([initial]),
+        findCampaignsByIds: jest.fn().mockResolvedValue([updated]),
+      } as unknown as CampaignSearchRepository;
+      return {
+        service: new CampaignServingSnapshotService(
+          repository,
+          configService,
+          undefined,
+          searchRepository
+        ),
+        searchRepository,
+      };
+    });
+
+    for (const instance of services) {
+      await instance.service.findCampaignsByIds(['c1']);
+      await (
+        instance.service as unknown as {
+          applyStreamEntry(id: string, fields: string[]): Promise<void>;
+        }
+      ).applyStreamEntry('20-0', eventFields);
+    }
+
+    for (const instance of services) {
+      await expect(
+        instance.service.findCampaignsByIds(['c1'])
+      ).resolves.toEqual([
+        expect.objectContaining({
+          servingVersion: 2,
+          title: 'broadcast-update',
+        }),
+      ]);
+      expect(
+        instance.searchRepository.findCampaignsByIds
+      ).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('detects a reconnect cursor outside the retained Stream range', async () => {
+    const repository = buildRepository([]);
+    const searchRedis = {
+      xrange: jest.fn().mockResolvedValue([['200-0', []]]),
+      xrevrange: jest.fn().mockResolvedValue([['300-0', []]]),
+    } as unknown as AppIORedisClient;
+    const service = new CampaignServingSnapshotService(
+      repository,
+      configService,
+      searchRedis
+    );
+
+    const gap = await (
+      service as unknown as {
+        hasStreamGap(cursor: string): Promise<boolean>;
+      }
+    ).hasStreamGap('100-0');
+
+    expect(gap).toBe(true);
+  });
+
+  it('keeps the previous COW snapshot when a gap rebuild fails', async () => {
+    const initial = { ...buildCampaign('c1'), servingVersion: 1 };
+    const repository = buildRepository([]);
+    const searchRepository = {
+      getAllSearchCampaigns: jest
+        .fn()
+        .mockResolvedValueOnce([initial])
+        .mockRejectedValueOnce(new Error('search unavailable')),
+      findCampaignsByIds: jest.fn(),
+    } as unknown as CampaignSearchRepository;
+    const service = new CampaignServingSnapshotService(
+      repository,
+      configService,
+      undefined,
+      searchRepository
+    );
+    await service.findCampaignsByIds(['c1']);
+
+    await expect(
+      (
+        service as unknown as {
+          rebuildSnapshot(): Promise<void>;
+        }
+      ).rebuildSnapshot()
+    ).rejects.toThrow('search unavailable');
+
+    await expect(service.findCampaignsByIds(['c1'])).resolves.toEqual([
+      expect.objectContaining({ id: 'c1', servingVersion: 1 }),
+    ]);
   });
 });

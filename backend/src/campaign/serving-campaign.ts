@@ -1,4 +1,8 @@
-import type { CachedCampaign, CampaignStatus } from './types/campaign.types';
+import type {
+  CachedCampaign,
+  CampaignStatus,
+  SearchCampaign,
+} from './types/campaign.types';
 
 /**
  * RTB 매칭과 광고 응답에 필요한 캠페인 조회 모델.
@@ -7,6 +11,8 @@ import type { CachedCampaign, CampaignStatus } from './types/campaign.types';
 export type ServingCampaign = {
   id: string;
   userId: number;
+  servingVersion: number;
+  indexReady?: boolean;
   title: string;
   content: string;
   image: string | null;
@@ -27,7 +33,9 @@ export type ServingCampaign = {
  * Redis 저장 모델을 RTB 조회 모델로 명시적으로 projection한다.
  * 저장 모델에 필드가 추가돼도 이 함수에 선언하지 않은 값은 snapshot에 유입되지 않는다.
  */
-export function toServingCampaign(campaign: CachedCampaign): ServingCampaign {
+export function toServingCampaign(
+  campaign: CachedCampaign | SearchCampaign
+): ServingCampaign {
   const embeddingTags = campaign.embeddingTags
     ? Object.fromEntries(
         Object.entries(campaign.embeddingTags).map(([tagName, vector]) => [
@@ -43,6 +51,8 @@ export function toServingCampaign(campaign: CachedCampaign): ServingCampaign {
   return {
     id: campaign.id,
     userId: campaign.userId,
+    servingVersion: campaign.servingVersion,
+    indexReady: campaign.indexReady,
     title: campaign.title,
     content: campaign.content,
     image: campaign.image,

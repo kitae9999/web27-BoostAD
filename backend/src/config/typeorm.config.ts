@@ -11,6 +11,7 @@ export const getTypeOrmConfig = (
   password: configService.get<string>('DB_PASSWORD', ''),
   database: configService.get<string>('DB_DATABASE', 'database'),
   entities: [__dirname + '/../**/*.entity{.ts,.js}'],
+  migrations: [__dirname + '/../migrations/*{.ts,.js}'],
   autoLoadEntities: false,
   synchronize: configService.get<string>('NODE_ENV') !== 'production', // 개발 시에만 자동 동기화
   logging:

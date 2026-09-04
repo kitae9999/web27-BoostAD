@@ -30,6 +30,15 @@ export class CampaignEntity {
   @Column({ name: 'user_id' })
   userId: number;
 
+  @Column({
+    name: 'serving_version',
+    type: 'bigint',
+    unsigned: true,
+    default: 1,
+    comment: 'Search/Budget serving projection revision',
+  })
+  servingVersion: number;
+
   @Column({ type: 'varchar', length: 255, comment: '광고 제목' })
   title: string;
 

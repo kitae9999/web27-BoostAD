@@ -1,7 +1,10 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { EventEmitter2 } from '@nestjs/event-emitter';
-import { IOREDIS_CLIENT } from 'src/redis/redis.constant';
+import {
+  BUDGET_REDIS_CLIENT,
+  SEARCH_REDIS_CLIENT,
+} from 'src/redis/redis.constant';
 import type { AppIORedisClient } from 'src/redis/redis.type';
 import {
   CampaignCacheRepository,
@@ -18,6 +21,7 @@ import {
   CampaignTagVectorSearchOptions,
   ReserveAuctionRequest,
   ReserveAuctionResult,
+  SearchCampaign,
 } from '../types/campaign.types';
 import {
   REDIS_COMMIT_AUCTION_SCRIPT,
@@ -25,10 +29,22 @@ import {
   REDIS_INCREMENT_SPENT_SCRIPT,
   REDIS_RELEASE_AUCTION_SCRIPT,
   REDIS_REPLACE_SPENT_SCRIPT,
-  REDIS_RESET_DAILY_BUDGET_SCRIPT,
   REDIS_RESERVE_AUCTION_SCRIPT,
+  REDIS_RESET_DAILY_BUDGET_SCRIPT,
   REDIS_SAVE_CAMPAIGN_PRESERVING_RESERVED_SCRIPT,
 } from '../scripts/lua-script';
+import {
+  REDIS_APPLY_BUDGET_PROJECTION_SCRIPT,
+  REDIS_APPLY_BUDGET_TOMBSTONE_SCRIPT,
+  REDIS_HASH_COMMIT_AUCTION_SCRIPT,
+  REDIS_HASH_DECREMENT_SPENT_SCRIPT,
+  REDIS_HASH_INCREMENT_SPENT_SCRIPT,
+  REDIS_HASH_RELEASE_AUCTION_SCRIPT,
+  REDIS_HASH_REPLACE_SPENT_SCRIPT,
+  REDIS_HASH_RESERVE_AUCTION_SCRIPT,
+  REDIS_HASH_RESET_DAILY_BUDGET_SCRIPT,
+  REDIS_HASH_RESET_LOADTEST_SCRIPT,
+} from '../scripts/budget-lua-script';
 import {
   AUCTION_KEY_PREFIX,
   AUCTION_RESERVATION_EXPIRATIONS,
@@ -46,15 +62,38 @@ import {
   toEmbeddingNamespace,
   type EmbeddingProfile,
 } from '../../rtb/ml/embedding-profile';
+import { CampaignSearchRepository } from './campaign-search.repository.interface';
+import {
+  CampaignBudgetRepository,
+  type CampaignBudgetState,
+} from './campaign-budget.repository.interface';
+import type {
+  CampaignProjectionDocument,
+  SearchSnapshotEvent,
+} from '../projection/campaign-projection.types';
+import {
+  REDIS_APPLY_SEARCH_EMBEDDING_SCRIPT,
+  REDIS_APPLY_SEARCH_PROJECTION_SCRIPT,
+  REDIS_APPLY_SEARCH_TOMBSTONE_SCRIPT,
+} from '../scripts/search-projection-lua-script';
+import { CircuitBreaker } from '../../common/resilience/circuit-breaker';
 
 @Injectable()
-export class RedisCampaignCacheRepository implements CampaignCacheRepository {
+export class RedisCampaignCacheRepository
+  implements
+    CampaignCacheRepository,
+    CampaignSearchRepository,
+    CampaignBudgetRepository
+{
   private readonly logger = createRtbPathLogger(
     RedisCampaignCacheRepository.name
   );
   private readonly logsEnabled = rtbPathLogsEnabled();
   private readonly KEY_PREFIX = 'campaign:';
+  private readonly BUDGET_KEY_PREFIX = 'budget:campaign:';
   private readonly CAMPAIGN_KEYS_SET = 'campaign:keys';
+  private readonly SEARCH_TOMBSTONE_PREFIX = 'campaign:tombstone:';
+  private readonly SEARCH_SNAPSHOT_STREAM = 'campaign:projection:stream';
   private readonly embeddingProfile: EmbeddingProfile;
   private readonly embeddingNamespace: string;
   private readonly campaignTagVectorPrefix: string;
@@ -69,6 +108,11 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   private readonly embeddingDimension: number;
   private readonly hnswGraphDegree: number;
   private readonly hnswEfConstruction: number;
+  private readonly snapshotStreamMaxLength: number;
+  private readonly splitTopology: boolean;
+  private readonly budgetRedisClient: AppIORedisClient;
+  private readonly searchCircuitBreaker: CircuitBreaker;
+  private readonly budgetCircuitBreaker: CircuitBreaker;
 
   private allCampaignsCache: {
     value: CachedCampaign[];
@@ -81,35 +125,415 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   private campaignDocumentVectorIndexReady: Promise<void> | null = null;
 
   constructor(
-    @Inject(IOREDIS_CLIENT) private readonly ioredisClient: AppIORedisClient,
+    @Inject(SEARCH_REDIS_CLIENT)
+    private readonly ioredisClient: AppIORedisClient,
     private readonly configService: ConfigService,
-    private readonly eventEmitter: EventEmitter2
+    private readonly eventEmitter: EventEmitter2,
+    @Optional()
+    @Inject(BUDGET_REDIS_CLIENT)
+    budgetRedisClient?: AppIORedisClient
   ) {
+    this.budgetRedisClient = budgetRedisClient ?? ioredisClient;
     this.embeddingProfile = resolveEmbeddingProfile(
       this.configService.get<string>('RTB_EMBEDDING_PROFILE')
     );
     this.embeddingNamespace = toEmbeddingNamespace(
       this.embeddingProfile.modelVersion
     );
-    // legacy profile은 기존 index를 그대로 사용해 rollback 비용을 없앤다.
+    this.splitTopology =
+      this.configService.get<string>('REDIS_TOPOLOGY_MODE', 'legacy') ===
+      'split';
+    // split 환경은 servingVersion 필드가 포함된 새 인덱스 namespace를 쓴다.
+    // legacy endpoint의 기존 인덱스를 변경하지 않아 즉시 rollback할 수 있다.
     const legacy = this.embeddingProfile.name === 'legacy_minilm';
-    this.campaignTagVectorPrefix = legacy
-      ? 'campaign-tag-vec:'
-      : `campaign-tag-vec:${this.embeddingNamespace}:`;
-    this.campaignTagVectorIndex = legacy
-      ? 'idx:campaign_tag_vec'
-      : `idx:campaign_tag_vec:${this.embeddingNamespace}`;
-    this.campaignTagVectorKeysPrefix = legacy
-      ? 'campaign-tag-vec-keys:'
-      : `campaign-tag-vec-keys:${this.embeddingNamespace}:`;
-    this.campaignDocumentVectorPrefix = `campaign-doc-vec:${this.embeddingNamespace}:`;
-    this.campaignDocumentVectorIndex = `idx:campaign_doc_vec:${this.embeddingNamespace}`;
+    this.campaignTagVectorPrefix = this.splitTopology
+      ? `campaign-tag-vec:projection-v2:${this.embeddingNamespace}:`
+      : legacy
+        ? 'campaign-tag-vec:'
+        : `campaign-tag-vec:${this.embeddingNamespace}:`;
+    this.campaignTagVectorIndex = this.splitTopology
+      ? `idx:campaign_tag_vec:projection-v2:${this.embeddingNamespace}`
+      : legacy
+        ? 'idx:campaign_tag_vec'
+        : `idx:campaign_tag_vec:${this.embeddingNamespace}`;
+    this.campaignTagVectorKeysPrefix = this.splitTopology
+      ? `campaign-tag-vec-keys:projection-v2:${this.embeddingNamespace}:`
+      : legacy
+        ? 'campaign-tag-vec-keys:'
+        : `campaign-tag-vec-keys:${this.embeddingNamespace}:`;
+    this.campaignDocumentVectorPrefix = this.splitTopology
+      ? `campaign-doc-vec:projection-v2:${this.embeddingNamespace}:`
+      : `campaign-doc-vec:${this.embeddingNamespace}:`;
+    this.campaignDocumentVectorIndex = this.splitTopology
+      ? `idx:campaign_doc_vec:projection-v2:${this.embeddingNamespace}`
+      : `idx:campaign_doc_vec:${this.embeddingNamespace}`;
     this.embeddingDimension = this.embeddingProfile.dimension;
     this.hnswGraphDegree = this.getPositiveIntEnv('RTB_MATCHER_ANN_HNSW_M', 16);
     this.hnswEfConstruction = this.getPositiveIntEnv(
       'RTB_MATCHER_ANN_HNSW_EF_CONSTRUCTION',
       200
     );
+    this.snapshotStreamMaxLength = this.getPositiveIntEnv(
+      'SEARCH_PROJECTION_STREAM_MAXLEN',
+      100_000
+    );
+    const breakerFailures = this.getPositiveIntEnv(
+      'REDIS_CIRCUIT_BREAKER_FAILURE_THRESHOLD',
+      5
+    );
+    const breakerOpenMs = this.getPositiveIntEnv(
+      'REDIS_CIRCUIT_BREAKER_OPEN_MS',
+      5_000
+    );
+    this.searchCircuitBreaker = new CircuitBreaker(
+      'search-redis',
+      breakerFailures,
+      breakerOpenMs
+    );
+    this.budgetCircuitBreaker = new CircuitBreaker(
+      'budget-redis',
+      breakerFailures,
+      breakerOpenMs
+    );
+  }
+
+  async applyBudgetProjection(
+    campaign: CampaignProjectionDocument
+  ): Promise<boolean> {
+    const budgetDate = this.getKstBudgetDate(Date.now());
+    const result = Number(
+      await this.budgetRedisClient.eval(
+        REDIS_APPLY_BUDGET_PROJECTION_SCRIPT,
+        1,
+        this.getBudgetCampaignKey(campaign.id),
+        JSON.stringify({ ...campaign, budgetDate })
+      )
+    );
+    return result >= 0;
+  }
+
+  async applyBudgetTombstone(
+    campaignId: string,
+    servingVersion: number,
+    fallback?: CampaignProjectionDocument
+  ): Promise<boolean> {
+    const result = Number(
+      await this.budgetRedisClient.eval(
+        REDIS_APPLY_BUDGET_TOMBSTONE_SCRIPT,
+        1,
+        this.getBudgetCampaignKey(campaignId),
+        String(servingVersion),
+        fallback
+          ? JSON.stringify({
+              ...fallback,
+              budgetDate: this.getKstBudgetDate(Date.now()),
+            })
+          : ''
+      )
+    );
+    return result >= 0;
+  }
+
+  async getBudgetState(
+    campaignId: string
+  ): Promise<CampaignBudgetState | null> {
+    if (!this.splitTopology) {
+      const campaign = await this.findCampaignCacheById(campaignId);
+      if (!campaign) return null;
+      return {
+        servingVersion: Number(campaign.servingVersion ?? 1),
+        tombstone: false,
+        status: campaign.status,
+        maxCpc: campaign.maxCpc,
+        dailyBudget: campaign.dailyBudget,
+        totalBudget: campaign.totalBudget,
+        dailySpent: campaign.dailySpent,
+        totalSpent: campaign.totalSpent,
+        dailyReserved: campaign.dailyReserved ?? 0,
+        totalReserved: campaign.totalReserved ?? 0,
+      };
+    }
+    const state = await this.budgetRedisClient.hgetall(
+      this.getBudgetCampaignKey(campaignId)
+    );
+    if (!state.servingVersion) return null;
+    return {
+      servingVersion: Number(state.servingVersion),
+      tombstone: state.tombstone === '1',
+      status: state.status ?? '',
+      maxCpc: Number(state.maxCpc ?? 0),
+      dailyBudget: Number(state.dailyBudget ?? 0),
+      totalBudget:
+        state.totalBudget === undefined || state.totalBudget === ''
+          ? null
+          : Number(state.totalBudget),
+      dailySpent: Number(state.dailySpent ?? 0),
+      totalSpent: Number(state.totalSpent ?? 0),
+      dailyReserved: Number(state.dailyReserved ?? 0),
+      totalReserved: Number(state.totalReserved ?? 0),
+    };
+  }
+
+  async setOperationalStatus(id: string, status: string): Promise<boolean> {
+    if (!this.splitTopology) {
+      const key = this.getCampaignCacheKey(id);
+      if (!(await this.ioredisClient.exists(key))) return false;
+      await this.ioredisClient.call(
+        'JSON.SET',
+        key,
+        '$.status',
+        JSON.stringify(status)
+      );
+      return true;
+    }
+    const key = this.getBudgetCampaignKey(id);
+    if (!(await this.budgetRedisClient.exists(key))) return false;
+    await this.budgetRedisClient.hset(key, 'status', status);
+    return true;
+  }
+
+  async replaceSpent(
+    id: string,
+    dailySpent: number,
+    totalSpent: number
+  ): Promise<boolean> {
+    if (!this.splitTopology) {
+      return (
+        Number(
+          await this.ioredisClient.eval(
+            REDIS_REPLACE_SPENT_SCRIPT,
+            1,
+            this.getCampaignCacheKey(id),
+            String(dailySpent),
+            String(totalSpent)
+          )
+        ) === 1
+      );
+    }
+    const replaced = Number(
+      await this.budgetRedisClient.eval(
+        REDIS_HASH_REPLACE_SPENT_SCRIPT,
+        1,
+        this.getBudgetCampaignKey(id),
+        String(dailySpent),
+        String(totalSpent)
+      )
+    );
+    return replaced === 1;
+  }
+
+  async resetDailySpent(id: string): Promise<boolean> {
+    const now = new Date();
+    if (!this.splitTopology) {
+      return (
+        Number(
+          await this.ioredisClient.eval(
+            REDIS_RESET_DAILY_BUDGET_SCRIPT,
+            1,
+            this.getCampaignCacheKey(id),
+            this.getKstBudgetDate(now.getTime()),
+            now.toISOString()
+          )
+        ) === 1
+      );
+    }
+    const reset = Number(
+      await this.budgetRedisClient.eval(
+        REDIS_HASH_RESET_DAILY_BUDGET_SCRIPT,
+        1,
+        this.getBudgetCampaignKey(id),
+        this.getKstBudgetDate(now.getTime()),
+        now.toISOString()
+      )
+    );
+    return reset === 1;
+  }
+
+  async resetForLoadTest(id: string): Promise<boolean> {
+    const now = new Date();
+    if (!this.splitTopology) {
+      const campaign = await this.findCampaignCacheById(id);
+      if (!campaign) return false;
+      await this.saveCampaignCacheById(
+        id,
+        {
+          ...campaign,
+          dailySpent: 0,
+          totalSpent: 0,
+          dailyReserved: 0,
+          totalReserved: 0,
+          dailyReservedDate: this.getKstBudgetDate(now.getTime()),
+          lastResetDate: now.toISOString(),
+        },
+        undefined,
+        { preserveReservation: false }
+      );
+      return true;
+    }
+    return (
+      Number(
+        await this.budgetRedisClient.eval(
+          REDIS_HASH_RESET_LOADTEST_SCRIPT,
+          1,
+          this.getBudgetCampaignKey(id),
+          this.getKstBudgetDate(now.getTime()),
+          now.toISOString()
+        )
+      ) === 1
+    );
+  }
+
+  async applySearchProjection(
+    campaign: CampaignProjectionDocument
+  ): Promise<{ applied: boolean; requiresEmbedding: boolean }> {
+    const cached = this.toSearchCampaign(campaign);
+    const raw = (await this.ioredisClient.eval(
+      REDIS_APPLY_SEARCH_PROJECTION_SCRIPT,
+      3,
+      this.getCampaignCacheKey(campaign.id),
+      this.getSearchTombstoneKey(campaign.id),
+      this.CAMPAIGN_KEYS_SET,
+      JSON.stringify(cached),
+      this.embeddingProfile.modelVersion
+    )) as unknown[];
+    const code = Number(raw?.[0]);
+    const requiresEmbedding = Number(raw?.[1]) === 1;
+    const indexReady = Number(raw?.[2]) === 1;
+    if (code < 0) return { applied: false, requiresEmbedding: false };
+
+    const current = await this.findCampaignById(campaign.id);
+    if (!current) {
+      throw new Error(
+        `Search projection 적용 후 캠페인을 찾을 수 없습니다: ${campaign.id}`
+      );
+    }
+    await this.syncCampaignTagVectorDocs(current);
+    await this.syncCampaignDocumentVectorDoc(current);
+    this.publishUpsert(current);
+    await this.appendSnapshotEvent({
+      type: 'UPSERT',
+      campaignId: campaign.id,
+      servingVersion: campaign.servingVersion,
+      indexReady,
+    });
+    return { applied: code === 1, requiresEmbedding };
+  }
+
+  async applySearchTombstone(
+    campaignId: string,
+    servingVersion: number
+  ): Promise<boolean> {
+    const result = Number(
+      await this.ioredisClient.eval(
+        REDIS_APPLY_SEARCH_TOMBSTONE_SCRIPT,
+        3,
+        this.getCampaignCacheKey(campaignId),
+        this.getSearchTombstoneKey(campaignId),
+        this.CAMPAIGN_KEYS_SET,
+        String(servingVersion)
+      )
+    );
+    if (result < 0) return false;
+    await Promise.all([
+      this.deleteCampaignTagVectorDocs(campaignId),
+      this.deleteCampaignDocumentVectorDoc(campaignId),
+    ]);
+    this.allCampaignsCache = null;
+    this.eventEmitter.emit(CAMPAIGN_CACHE_REMOVED_EVENT, {
+      campaignId,
+      servingVersion,
+    });
+    await this.appendSnapshotEvent({
+      type: 'DELETE',
+      campaignId,
+      servingVersion,
+      indexReady: false,
+    });
+    return true;
+  }
+
+  async findCampaignById(id: string): Promise<SearchCampaign | null> {
+    const raw = await this.ioredisClient.call(
+      'JSON.GET',
+      this.getCampaignCacheKey(id)
+    );
+    if (raw === null) return null;
+    if (typeof raw !== 'string') {
+      throw new Error(`Search campaign 응답 형식 오류: ${id}`);
+    }
+    return JSON.parse(raw) as SearchCampaign;
+  }
+
+  async findCampaignsByIds(ids: string[]): Promise<SearchCampaign[]> {
+    const uniqueIds = [...new Set(ids.filter(Boolean))];
+    if (uniqueIds.length === 0) return [];
+    return this.findSearchCampaignsByKeysStrict(
+      uniqueIds.map((id) => this.getCampaignCacheKey(id))
+    );
+  }
+
+  async getAllSearchCampaigns(): Promise<SearchCampaign[]> {
+    const keys = (
+      await this.ioredisClient.smembers(this.CAMPAIGN_KEYS_SET)
+    ).filter((key) => key.startsWith(this.KEY_PREFIX));
+    if (keys.length === 0) return [];
+    return this.findSearchCampaignsByKeysStrict(keys);
+  }
+
+  async updateEmbeddingsIfCurrent(
+    id: string,
+    servingVersion: number,
+    semanticHash: string,
+    payload: CampaignEmbeddingPayload
+  ): Promise<boolean> {
+    const applied = Number(
+      await this.ioredisClient.eval(
+        REDIS_APPLY_SEARCH_EMBEDDING_SCRIPT,
+        2,
+        this.getCampaignCacheKey(id),
+        this.getSearchTombstoneKey(id),
+        String(servingVersion),
+        semanticHash,
+        JSON.stringify(payload)
+      )
+    );
+    if (applied !== 1) return false;
+    const current = await this.findCampaignById(id);
+    if (!current) {
+      throw new Error(`Embedding 적용 후 캠페인을 찾을 수 없습니다: ${id}`);
+    }
+    await this.syncCampaignTagVectorDocs(current);
+    await this.syncCampaignDocumentVectorDoc(current);
+    this.publishUpsert(current);
+    await this.appendSnapshotEvent({
+      type: 'UPSERT',
+      campaignId: id,
+      servingVersion,
+      indexReady: true,
+    });
+    return true;
+  }
+
+  async appendSnapshotEvent(event: SearchSnapshotEvent): Promise<string> {
+    const streamId = await this.ioredisClient.xadd(
+      this.SEARCH_SNAPSHOT_STREAM,
+      'MAXLEN',
+      '~',
+      String(this.snapshotStreamMaxLength),
+      '*',
+      'type',
+      event.type,
+      'campaignId',
+      event.campaignId,
+      'servingVersion',
+      String(event.servingVersion),
+      'indexReady',
+      event.indexReady ? '1' : '0'
+    );
+    if (!streamId) {
+      throw new Error('Search snapshot Stream ID를 받지 못했습니다');
+    }
+    return streamId;
   }
 
   async saveCampaignCacheById(
@@ -118,10 +542,35 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
     ttl = this.CAMPAIGN_CACHE_TTL,
     options: CampaignCacheSaveOptions = {}
   ): Promise<void> {
+    void ttl;
     const key = this.getCampaignCacheKey(id);
     const normalized = this.withReservationDefaults(data);
 
     try {
+      if (this.splitTopology) {
+        const projection = this.toProjectionDocument(normalized);
+        await this.applyBudgetProjection(projection);
+        await this.applySearchProjection(projection);
+
+        if (
+          normalized.embeddingModelVersion &&
+          normalized.embeddingTags &&
+          normalized.embeddingDocument
+        ) {
+          await this.updateEmbeddingsIfCurrent(
+            id,
+            normalized.servingVersion,
+            projection.semanticHash,
+            {
+              modelVersion: normalized.embeddingModelVersion,
+              tags: normalized.embeddingTags,
+              document: normalized.embeddingDocument,
+            }
+          );
+        }
+        return;
+      }
+
       if (options.preserveReservation === false) {
         await this.ioredisClient.call(
           'JSON.SET',
@@ -139,9 +588,10 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
         );
       }
       await Promise.all([
-        this.ioredisClient.expire(key, ttl), // Key에 TTL을 설정하는 명령 expire
+        this.ioredisClient.persist(key),
         this.ioredisClient.sadd(this.CAMPAIGN_KEYS_SET, key),
       ]);
+      await this.applyBudgetProjection(this.toProjectionDocument(normalized));
       await this.syncCampaignTagVectorDocs(normalized);
       await this.syncCampaignDocumentVectorDoc(normalized);
       this.publishUpsert(normalized);
@@ -233,6 +683,9 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       await Promise.all(updatePromises);
       const updatedCampaign = await this.findCampaignCacheById(id);
       if (updatedCampaign) {
+        await this.applyBudgetProjection(
+          this.toProjectionDocument(updatedCampaign)
+        );
         await this.syncCampaignTagVectorDocs(updatedCampaign);
         await this.syncCampaignDocumentVectorDoc(updatedCampaign);
         this.publishUpsert(updatedCampaign);
@@ -253,6 +706,11 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
         key,
         '$.status',
         JSON.stringify(status)
+      );
+      await this.budgetRedisClient.hset(
+        this.getBudgetCampaignKey(id),
+        'status',
+        status
       );
       const updatedCampaign = await this.findCampaignCacheById(id);
       if (updatedCampaign) {
@@ -303,15 +761,21 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   }
 
   async updateDailySpentCacheById(id: string, amount: number): Promise<void> {
-    const key = this.getCampaignCacheKey(id);
-
     try {
-      await this.ioredisClient.call(
-        'JSON.NUMINCRBY', // Redis에게 ADD에 대한 명령을 통한 원자적 연산 수행
-        key,
-        '$.dailySpent',
-        amount.toString()
-      );
+      if (this.splitTopology) {
+        await this.budgetRedisClient.hincrby(
+          this.getBudgetCampaignKey(id),
+          'dailySpent',
+          amount
+        );
+      } else {
+        await this.ioredisClient.call(
+          'JSON.NUMINCRBY',
+          this.getCampaignCacheKey(id),
+          '$.dailySpent',
+          amount.toString()
+        );
+      }
     } catch (error) {
       this.logger.error(`dailySpent 업데이트 실패: ${id}`, error);
       throw error;
@@ -323,19 +787,19 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
     dailySpent: number,
     totalSpent: number
   ): Promise<void> {
-    const key = this.getCampaignCacheKey(id);
-
     try {
-      const replaced = Number(
-        await this.ioredisClient.eval(
-          REDIS_REPLACE_SPENT_SCRIPT,
-          1,
-          key,
-          String(dailySpent),
-          String(totalSpent)
-        )
-      );
-      if (replaced !== 1) {
+      const replaced = this.splitTopology
+        ? await this.replaceSpent(id, dailySpent, totalSpent)
+        : Number(
+            await this.ioredisClient.eval(
+              REDIS_REPLACE_SPENT_SCRIPT,
+              1,
+              this.getCampaignCacheKey(id),
+              String(dailySpent),
+              String(totalSpent)
+            )
+          ) === 1;
+      if (!replaced) {
         this.logger.warn(`spent 교체 대상 캠페인 캐시 없음: ${id}`);
       }
     } catch (error) {
@@ -345,17 +809,19 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   }
 
   async resetDailySpentCache(id: string): Promise<void> {
-    const key = this.getCampaignCacheKey(id);
-    const now = new Date();
-
     try {
-      await this.ioredisClient.eval(
-        REDIS_RESET_DAILY_BUDGET_SCRIPT,
-        1,
-        key,
-        this.getKstBudgetDate(now.getTime()),
-        now.toISOString()
-      );
+      if (this.splitTopology) {
+        await this.resetDailySpent(id);
+      } else {
+        const now = new Date();
+        await this.ioredisClient.eval(
+          REDIS_RESET_DAILY_BUDGET_SCRIPT,
+          1,
+          this.getCampaignCacheKey(id),
+          this.getKstBudgetDate(now.getTime()),
+          now.toISOString()
+        );
+      }
     } catch (error) {
       this.logger.error(`일일 예산 리셋 실패: ${id}`, error);
       throw error;
@@ -363,15 +829,17 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   }
 
   async incrementSpent(campaignId: string, cpc: number): Promise<boolean> {
-    const key = this.getCampaignCacheKey(campaignId);
+    const key = this.splitTopology
+      ? this.getBudgetCampaignKey(campaignId)
+      : this.getCampaignCacheKey(campaignId);
+    const script = this.splitTopology
+      ? REDIS_HASH_INCREMENT_SPENT_SCRIPT
+      : REDIS_INCREMENT_SPENT_SCRIPT;
 
     try {
       // lua 스크립트로 트랜잭션 처리
-      const result = (await this.ioredisClient.eval(
-        REDIS_INCREMENT_SPENT_SCRIPT,
-        1,
-        key,
-        cpc.toString()
+      const result = (await this.budgetCircuitBreaker.execute(() =>
+        this.budgetRedisClient.eval(script, 1, key, cpc.toString())
       )) as number;
 
       if (result === 1) {
@@ -419,37 +887,62 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
 
     const auctionKey = this.getAuctionKey(request.auctionId);
     const campaignKeys = request.candidates.map((candidate) =>
-      this.getCampaignCacheKey(candidate.campaignId)
+      this.splitTopology
+        ? this.getBudgetCampaignKey(candidate.campaignId)
+        : this.getCampaignCacheKey(candidate.campaignId)
     );
-    const cpcs = request.candidates.map((candidate) => String(candidate.cpc));
+    const servingVersions = request.candidates.map((candidate) =>
+      String(candidate.servingVersion)
+    );
     const campaignIds = request.candidates.map(
       (candidate) => candidate.campaignId
     );
 
     try {
-      const raw = (await this.ioredisClient.eval(
-        REDIS_RESERVE_AUCTION_SCRIPT,
-        campaignKeys.length + 2,
-        AUCTION_RESERVATION_EXPIRATIONS,
-        auctionKey,
-        ...campaignKeys,
-        request.auctionId,
-        String(request.blogId),
-        request.budgetDate,
-        String(request.expiresAt),
-        String(this.CAMPAIGN_CACHE_TTL),
-        ...cpcs,
-        ...campaignIds
+      const script = this.splitTopology
+        ? REDIS_HASH_RESERVE_AUCTION_SCRIPT
+        : REDIS_RESERVE_AUCTION_SCRIPT;
+      const operationArgs = this.splitTopology
+        ? [...servingVersions, ...campaignIds]
+        : [
+            String(this.CAMPAIGN_CACHE_TTL),
+            ...request.candidates.map((candidate) => {
+              if (typeof candidate.cpc !== 'number') {
+                throw new Error(
+                  `legacy winner-only 예약 CPC 누락: ${candidate.campaignId}`
+                );
+              }
+              return String(candidate.cpc);
+            }),
+            ...campaignIds,
+          ];
+      const raw = (await this.budgetCircuitBreaker.execute(() =>
+        this.budgetRedisClient.eval(
+          script,
+          campaignKeys.length + 2,
+          AUCTION_RESERVATION_EXPIRATIONS,
+          auctionKey,
+          ...campaignKeys,
+          request.auctionId,
+          String(request.blogId),
+          request.budgetDate,
+          String(request.expiresAt),
+          ...operationArgs
+        )
       )) as unknown[];
       const code = Number(raw?.[0]);
       const attemptedCount = Number(raw?.[2] ?? request.candidates.length);
       const reservation = this.parseAuctionReservation(raw?.[3]);
+      const versionMismatchCount = this.splitTopology
+        ? Number(raw?.[4] ?? 0)
+        : 0;
 
       if (code === 1) {
         return {
           outcome: 'reserved',
           reservation: reservation ?? undefined,
           attemptedCount,
+          versionMismatchCount,
         };
       }
       if (code === 2) {
@@ -457,12 +950,20 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
           outcome: 'existing',
           reservation: reservation ?? undefined,
           attemptedCount,
+          versionMismatchCount,
         };
       }
       if (code === -2) {
         return { outcome: 'conflict', attemptedCount };
       }
-      return { outcome: 'exhausted', attemptedCount };
+      if (code === -3) {
+        return {
+          outcome: 'version_mismatch',
+          attemptedCount,
+          versionMismatchCount,
+        };
+      }
+      return { outcome: 'exhausted', attemptedCount, versionMismatchCount };
     } catch (error) {
       this.logger.error(`경매 예약 생성 실패: ${request.auctionId}`, error);
       throw error;
@@ -472,7 +973,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   async getAuctionReservation(
     auctionId: string
   ): Promise<AuctionReservationRecord | null> {
-    const raw = await this.ioredisClient.get(this.getAuctionKey(auctionId));
+    const raw = await this.budgetRedisClient.get(this.getAuctionKey(auctionId));
     return this.parseAuctionReservation(raw);
   }
 
@@ -483,7 +984,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   ): Promise<AuctionTransitionResult> {
     const current = await this.getAuctionReservation(auctionId);
     if (!current) {
-      await this.ioredisClient.zrem(
+      await this.budgetRedisClient.zrem(
         AUCTION_RESERVATION_EXPIRATIONS,
         auctionId
       );
@@ -499,16 +1000,23 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       return { outcome: 'invalid', reservation: current };
     }
 
-    const raw = (await this.ioredisClient.eval(
-      REDIS_COMMIT_AUCTION_SCRIPT,
-      3,
-      this.getAuctionKey(auctionId),
-      AUCTION_RESERVATION_EXPIRATIONS,
-      this.getCampaignCacheKey(current.campaignId),
-      auctionId,
-      currentBudgetDate,
-      String(terminalTtlSeconds),
-      String(Date.now())
+    const legacyReservation = current.version === 1;
+    const raw = (await this.budgetCircuitBreaker.execute(() =>
+      this.budgetRedisClient.eval(
+        legacyReservation
+          ? REDIS_COMMIT_AUCTION_SCRIPT
+          : REDIS_HASH_COMMIT_AUCTION_SCRIPT,
+        3,
+        this.getAuctionKey(auctionId),
+        AUCTION_RESERVATION_EXPIRATIONS,
+        legacyReservation
+          ? this.getCampaignCacheKey(current.campaignId)
+          : this.getBudgetCampaignKey(current.campaignId),
+        auctionId,
+        currentBudgetDate,
+        String(terminalTtlSeconds),
+        String(Date.now())
+      )
     )) as unknown[];
     return this.toTransitionResult(Number(raw?.[0]), raw?.[1], 'commit');
   }
@@ -519,7 +1027,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   ): Promise<AuctionTransitionResult> {
     const current = await this.getAuctionReservation(auctionId);
     if (!current) {
-      await this.ioredisClient.zrem(
+      await this.budgetRedisClient.zrem(
         AUCTION_RESERVATION_EXPIRATIONS,
         auctionId
       );
@@ -535,15 +1043,22 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       return { outcome: 'invalid', reservation: current };
     }
 
-    const raw = (await this.ioredisClient.eval(
-      REDIS_RELEASE_AUCTION_SCRIPT,
-      3,
-      this.getAuctionKey(auctionId),
-      AUCTION_RESERVATION_EXPIRATIONS,
-      this.getCampaignCacheKey(current.campaignId),
-      auctionId,
-      String(terminalTtlSeconds),
-      String(Date.now())
+    const legacyReservation = current.version === 1;
+    const raw = (await this.budgetCircuitBreaker.execute(() =>
+      this.budgetRedisClient.eval(
+        legacyReservation
+          ? REDIS_RELEASE_AUCTION_SCRIPT
+          : REDIS_HASH_RELEASE_AUCTION_SCRIPT,
+        3,
+        this.getAuctionKey(auctionId),
+        AUCTION_RESERVATION_EXPIRATIONS,
+        legacyReservation
+          ? this.getCampaignCacheKey(current.campaignId)
+          : this.getBudgetCampaignKey(current.campaignId),
+        auctionId,
+        String(terminalTtlSeconds),
+        String(Date.now())
+      )
     )) as unknown[];
     return this.toTransitionResult(Number(raw?.[0]), raw?.[1], 'release');
   }
@@ -553,7 +1068,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
     limit: number
   ): Promise<string[]> {
     if (limit <= 0) return [];
-    return this.ioredisClient.zrangebyscore(
+    return this.budgetRedisClient.zrangebyscore(
       AUCTION_RESERVATION_EXPIRATIONS,
       '-inf',
       String(nowEpochMs),
@@ -564,11 +1079,16 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   }
 
   async decrementSpent(campaignId: string, cpc: number): Promise<void> {
-    const key = this.getCampaignCacheKey(campaignId);
+    const key = this.splitTopology
+      ? this.getBudgetCampaignKey(campaignId)
+      : this.getCampaignCacheKey(campaignId);
+    const script = this.splitTopology
+      ? REDIS_HASH_DECREMENT_SPENT_SCRIPT
+      : REDIS_DECREMENT_SPENT_SCRIPT;
 
     try {
-      const result = (await this.ioredisClient.eval(
-        REDIS_DECREMENT_SPENT_SCRIPT,
+      const result = (await this.budgetRedisClient.eval(
+        script,
         1,
         key,
         cpc.toString() // 양수로 전달 (Lua에서 -cpc 처리)
@@ -605,15 +1125,14 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   }
 
   async deleteCampaignCacheById(id: string): Promise<void> {
-    const key = this.getCampaignCacheKey(id);
-    await Promise.all([
-      this.ioredisClient.del(key),
-      this.ioredisClient.srem(this.CAMPAIGN_KEYS_SET, key),
-      this.deleteCampaignTagVectorDocs(id),
-      this.deleteCampaignDocumentVectorDoc(id),
-    ]);
-    this.allCampaignsCache = null;
-    this.eventEmitter.emit(CAMPAIGN_CACHE_REMOVED_EVENT, { campaignId: id });
+    const current = await this.findCampaignCacheById(id);
+    const servingVersion = current?.servingVersion ?? 0;
+    await this.applyBudgetTombstone(
+      id,
+      servingVersion,
+      current ? this.toProjectionDocument(current) : undefined
+    );
+    await this.applySearchTombstone(id, servingVersion);
     this.logger.debug(`캐시 삭제: ${id}`);
   }
 
@@ -721,33 +1240,36 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       `=>[KNN ${topL} @embedding $query_vec AS vector_distance]`;
 
     try {
-      const raw = await this.ioredisClient.call(
-        'FT.SEARCH',
-        this.campaignTagVectorIndex,
-        query,
-        'PARAMS',
-        '2',
-        'query_vec',
-        vectorQuery,
-        'SORTBY',
-        'vector_distance',
-        'ASC',
-        'RETURN',
-        '3',
-        'campaignId',
-        'tagName',
-        'vector_distance',
-        'LIMIT',
-        '0',
-        String(topL),
-        'DIALECT',
-        '2'
+      const raw = await this.searchCircuitBreaker.execute(() =>
+        this.ioredisClient.call(
+          'FT.SEARCH',
+          this.campaignTagVectorIndex,
+          query,
+          'PARAMS',
+          '2',
+          'query_vec',
+          vectorQuery,
+          'SORTBY',
+          'vector_distance',
+          'ASC',
+          'RETURN',
+          '4',
+          'campaignId',
+          'servingVersion',
+          'tagName',
+          'vector_distance',
+          'LIMIT',
+          '0',
+          String(topL),
+          'DIALECT',
+          '2'
+        )
       );
 
       return this.parseCampaignTagVectorSearchResults(raw);
     } catch (error) {
       this.logger.error('campaign-tag ANN 검색 실패', error);
-      return [];
+      throw error;
     }
   }
 
@@ -766,35 +1288,38 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       `=>[KNN ${topL} @embedding $query_vec AS vector_distance]`;
 
     try {
-      const raw = await this.ioredisClient.call(
-        'FT.SEARCH',
-        this.campaignDocumentVectorIndex,
-        query,
-        'PARAMS',
-        '2',
-        'query_vec',
-        vectorQuery,
-        'SORTBY',
-        'vector_distance',
-        'ASC',
-        'RETURN',
-        '2',
-        'campaignId',
-        'vector_distance',
-        'LIMIT',
-        '0',
-        String(topL),
-        'DIALECT',
-        '2'
+      const raw = await this.searchCircuitBreaker.execute(() =>
+        this.ioredisClient.call(
+          'FT.SEARCH',
+          this.campaignDocumentVectorIndex,
+          query,
+          'PARAMS',
+          '2',
+          'query_vec',
+          vectorQuery,
+          'SORTBY',
+          'vector_distance',
+          'ASC',
+          'RETURN',
+          '3',
+          'campaignId',
+          'servingVersion',
+          'vector_distance',
+          'LIMIT',
+          '0',
+          String(topL),
+          'DIALECT',
+          '2'
+        )
       );
       return this.parseCampaignDocumentVectorSearchResults(raw);
     } catch (error) {
       this.logger.error('campaign-document ANN 검색 실패', error);
-      return [];
+      throw error;
     }
   }
 
-  private publishUpsert(campaign: CachedCampaign): void {
+  private publishUpsert(campaign: CachedCampaign | SearchCampaign): void {
     this.allCampaignsCache = null;
     this.eventEmitter.emit(CAMPAIGN_CACHE_UPSERTED_EVENT, { campaign });
   }
@@ -836,8 +1361,100 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
     return `${this.KEY_PREFIX}${id}`;
   }
 
+  private async findSearchCampaignsByKeysStrict(
+    keys: string[]
+  ): Promise<SearchCampaign[]> {
+    const campaigns: SearchCampaign[] = [];
+    const batchSize = 200;
+    for (let index = 0; index < keys.length; index += batchSize) {
+      const batch = keys.slice(index, index + batchSize);
+      const pipeline = this.ioredisClient.pipeline();
+      batch.forEach((key) => pipeline.call('JSON.GET', key));
+      const results = await pipeline.exec();
+      if (!results) {
+        throw new Error('Search campaign pipeline 응답이 없습니다');
+      }
+      for (
+        let resultIndex = 0;
+        resultIndex < results.length;
+        resultIndex += 1
+      ) {
+        const [error, raw] = results[resultIndex];
+        if (error) throw error;
+        if (raw === null) continue;
+        if (typeof raw !== 'string') {
+          throw new Error(
+            `Search campaign 응답 형식 오류: ${batch[resultIndex]}`
+          );
+        }
+        campaigns.push(JSON.parse(raw) as SearchCampaign);
+      }
+    }
+    return campaigns;
+  }
+
+  private getBudgetCampaignKey(id: string): string {
+    return `${this.BUDGET_KEY_PREFIX}${id}`;
+  }
+
+  private getSearchTombstoneKey(id: string): string {
+    return `${this.SEARCH_TOMBSTONE_PREFIX}${id}`;
+  }
+
   private getAuctionKey(auctionId: string): string {
     return `${AUCTION_KEY_PREFIX}${auctionId}`;
+  }
+
+  private toSearchCampaign(
+    campaign: CampaignProjectionDocument
+  ): SearchCampaign {
+    return {
+      id: campaign.id,
+      userId: campaign.userId,
+      servingVersion: campaign.servingVersion,
+      semanticHash: campaign.semanticHash,
+      indexReady: false,
+      title: campaign.title,
+      content: campaign.content,
+      image: campaign.image,
+      url: campaign.url,
+      maxCpc: campaign.maxCpc,
+      isHighIntent: campaign.isHighIntent,
+      status: campaign.status,
+      startDate: campaign.startDate,
+      endDate: campaign.endDate,
+      createdAt: campaign.createdAt,
+      deletedAt: campaign.deletedAt,
+      tags: campaign.tags,
+    };
+  }
+
+  private toProjectionDocument(
+    campaign: CachedCampaign
+  ): CampaignProjectionDocument {
+    return {
+      id: campaign.id,
+      userId: campaign.userId,
+      servingVersion: campaign.servingVersion,
+      title: campaign.title,
+      content: campaign.content,
+      image: campaign.image,
+      url: campaign.url,
+      maxCpc: campaign.maxCpc,
+      dailyBudget: campaign.dailyBudget,
+      totalBudget: campaign.totalBudget,
+      dailySpent: campaign.dailySpent,
+      totalSpent: campaign.totalSpent,
+      lastResetDate: campaign.lastResetDate,
+      isHighIntent: campaign.isHighIntent,
+      status: campaign.status,
+      startDate: campaign.startDate,
+      endDate: campaign.endDate,
+      createdAt: campaign.createdAt,
+      deletedAt: campaign.deletedAt,
+      tags: campaign.tags ?? [],
+      semanticHash: campaign.semanticHash ?? '',
+    };
   }
 
   private parseAuctionReservation(
@@ -845,8 +1462,11 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   ): AuctionReservationRecord | null {
     if (typeof raw !== 'string' || raw.length === 0) return null;
     try {
-      const parsed = JSON.parse(raw) as Partial<AuctionReservationRecord>;
-      if (parsed.version !== 1 || typeof parsed.auctionId !== 'string') {
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      if (
+        (parsed.version !== 1 && parsed.version !== 2) ||
+        typeof parsed.auctionId !== 'string'
+      ) {
         return null;
       }
       if (
@@ -866,6 +1486,12 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
         ) {
           return null;
         }
+        if (
+          parsed.version === 2 &&
+          typeof parsed.campaignServingVersion !== 'number'
+        ) {
+          return null;
+        }
       }
       return parsed as AuctionReservationRecord;
     } catch {
@@ -878,8 +1504,8 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
     rawReservation: unknown,
     operation: 'commit' | 'release'
   ): AuctionTransitionResult {
-    const reservation = this.parseAuctionReservation(rawReservation) ??
-      undefined;
+    const reservation =
+      this.parseAuctionReservation(rawReservation) ?? undefined;
     if (code === 1) {
       return {
         outcome: operation === 'commit' ? 'committed' : 'released',
@@ -917,9 +1543,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   }
 
   private getKstBudgetDate(epochMs: number): string {
-    return new Date(epochMs + 9 * 60 * 60 * 1000)
-      .toISOString()
-      .slice(0, 10);
+    return new Date(epochMs + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
   }
 
   private getCampaignTagVectorDocKey(
@@ -984,6 +1608,8 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
           'SCHEMA',
           'campaignId',
           'TAG',
+          'servingVersion',
+          'NUMERIC',
           'tagName',
           'TAG',
           'status',
@@ -1060,6 +1686,8 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
         'SCHEMA',
         'campaignId',
         'TAG',
+        'servingVersion',
+        'NUMERIC',
         'status',
         'TAG',
         'isHighIntent',
@@ -1092,7 +1720,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   }
 
   private async syncCampaignTagVectorDocs(
-    campaign: CachedCampaign
+    campaign: CachedCampaign | SearchCampaign
   ): Promise<void> {
     const compatible =
       campaign.embeddingModelVersion === this.embeddingProfile.modelVersion ||
@@ -1131,6 +1759,8 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
         docKey,
         'campaignId',
         campaign.id,
+        'servingVersion',
+        String(campaign.servingVersion),
         'tagName',
         tagName,
         'status',
@@ -1157,7 +1787,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
   }
 
   private async syncCampaignDocumentVectorDoc(
-    campaign: CachedCampaign
+    campaign: CachedCampaign | SearchCampaign
   ): Promise<void> {
     const embedding = campaign.embeddingDocument;
     const compatible =
@@ -1178,6 +1808,8 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       key,
       'campaignId',
       campaign.id,
+      'servingVersion',
+      String(campaign.servingVersion),
       'status',
       campaign.status,
       'isHighIntent',
@@ -1238,10 +1870,16 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
       }
 
       const campaignId = fieldMap.get('campaignId');
+      const servingVersion = Number(fieldMap.get('servingVersion'));
       const tagName = fieldMap.get('tagName');
       const distanceRaw = fieldMap.get('vector_distance');
 
-      if (!campaignId || !tagName || distanceRaw === undefined) {
+      if (
+        !campaignId ||
+        !Number.isFinite(servingVersion) ||
+        !tagName ||
+        distanceRaw === undefined
+      ) {
         continue;
       }
 
@@ -1252,6 +1890,7 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
 
       hits.push({
         campaignId,
+        servingVersion,
         tagName,
         distance,
         similarity: Math.max(0, 1 - distance),
@@ -1281,12 +1920,19 @@ export class RedisCampaignCacheRepository implements CampaignCacheRepository {
         }
       }
       const campaignId = fieldMap.get('campaignId');
+      const servingVersion = Number(fieldMap.get('servingVersion'));
       const distance = Number.parseFloat(
         fieldMap.get('vector_distance') ?? 'NaN'
       );
-      if (!campaignId || !Number.isFinite(distance)) continue;
+      if (
+        !campaignId ||
+        !Number.isFinite(servingVersion) ||
+        !Number.isFinite(distance)
+      )
+        continue;
       hits.push({
         campaignId,
+        servingVersion,
         distance,
         similarity: Math.max(0, 1 - distance),
       });

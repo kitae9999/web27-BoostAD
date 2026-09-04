@@ -281,12 +281,23 @@ export class TransformerMatcher extends Matcher {
     // [3. 후보 검색 방식 분기]
     // ANN 모드는 dense 설정에 따라 semantic document 또는 legacy tag 검색으로 진입한다.
     if (this.annEnabled) {
-      return this.findCandidatesByAnn(
-        context,
-        requestEmbedding,
-        requestNorm,
-        requestTokens
-      );
+      try {
+        return await this.findCandidatesByAnn(
+          context,
+          requestEmbedding,
+          requestNorm,
+          requestTokens
+        );
+      } catch (error) {
+        if (!this.localSnapshotEnabled) throw error;
+        this.logger.warn(
+          `Search Redis ANN 실패, 로컬 스냅샷 lexical 경로로 전환: ${String(error)}`
+        );
+        return this.findCandidatesByLexicalFallback(
+          context,
+          'search_unavailable'
+        );
+      }
     }
 
     // [4. ANN OFF: 전체 캠페인 조회]
@@ -348,6 +359,7 @@ export class TransformerMatcher extends Matcher {
       | EmbeddingPendingReason
       | 'model_not_ready'
       | 'cache_error'
+      | 'search_unavailable'
       | 'semantic_index_unready'
       | `context_${string}`
   ): Promise<ScoredCandidate[]> {
@@ -503,9 +515,11 @@ export class TransformerMatcher extends Matcher {
     // [2. 태그 hit를 캠페인 단위로 집계]
     // 캠페인별 상위 태그 유사도와 coverage로 retrieval 순위를 만든 뒤 top-M ID만 유지한다.
     const groupHitsStartedAt = process.hrtime.bigint();
-    const retrievedCampaignIds = this.aggregateAnnTagHits(tagHits)
-      .slice(0, this.annTopM)
-      .map((item) => item.campaignId);
+    const retrieved = this.aggregateAnnTagHits(tagHits).slice(0, this.annTopM);
+    const retrievedCampaignIds = retrieved.map((item) => item.campaignId);
+    const retrievedVersionsById = new Map(
+      retrieved.map((item) => [item.campaignId, item.servingVersions] as const)
+    );
     this.metricsService.recordRtbStage(
       'match_ann_group_hits',
       'ok',
@@ -539,7 +553,15 @@ export class TransformerMatcher extends Matcher {
     const eligibleCampaigns = this.filterEligibleCampaigns(
       retrievedCampaigns,
       context.isHighIntent
-    );
+    ).filter((campaign) => {
+      const versions = retrievedVersionsById.get(campaign.id);
+      return (
+        campaign.indexReady !== false &&
+        (!versions ||
+          versions.length === 0 ||
+          versions.includes(campaign.servingVersion))
+      );
+    });
 
     // [종료 분기 D: 집행 가능한 검색 후보 없음]
     if (eligibleCampaigns.length === 0) {
@@ -637,14 +659,20 @@ export class TransformerMatcher extends Matcher {
         retrievedCampaigns,
         context.isHighIntent,
         false
-      ).map((campaign) => [campaign.id, campaign])
+      )
+        .filter((campaign) => campaign.indexReady !== false)
+        .map((campaign) => [campaign.id, campaign])
     );
+    const currentHits = retainedHits.filter((hit) => {
+      const campaign = eligibleById.get(hit.campaignId);
+      return campaign && this.matchesHitVersion(hit, campaign);
+    });
 
     // [5. 최종 후보 점수 생성]
     // 태그 기반 scoreCampaignByTags()를 거치지 않고 ANN이 반환한 문서 유사도를 그대로 사용한다.
     // buildCandidate()에서 CPC 30%와 문서 유사도 70%를 합산한다.
     const scoreStartedAt = process.hrtime.bigint();
-    const candidates = retainedHits.flatMap((hit) => {
+    const candidates = currentHits.flatMap((hit) => {
       const campaign = eligibleById.get(hit.campaignId);
       return campaign ? [this.buildCandidate(campaign, hit.similarity)] : [];
     });
@@ -667,7 +695,7 @@ export class TransformerMatcher extends Matcher {
       const hybrid = await this.buildHybridCandidates(
         context,
         requestEmbedding,
-        retainedHits,
+        currentHits,
         candidates
       );
       return hybrid.length > 0 ? hybrid : candidates;
@@ -707,9 +735,15 @@ export class TransformerMatcher extends Matcher {
         retrievedCampaigns,
         context.isHighIntent,
         false
-      ).map((campaign) => [campaign.id, campaign])
+      )
+        .filter((campaign) => campaign.indexReady !== false)
+        .map((campaign) => [campaign.id, campaign])
     );
-    const primary = retainedHits.flatMap((hit) => {
+    const currentHits = retainedHits.filter((hit) => {
+      const campaign = eligibleById.get(hit.campaignId);
+      return campaign && this.matchesHitVersion(hit, campaign);
+    });
+    const primary = currentHits.flatMap((hit) => {
       const campaign = eligibleById.get(hit.campaignId);
       return campaign ? [this.buildCandidate(campaign, hit.similarity)] : [];
     });
@@ -720,7 +754,7 @@ export class TransformerMatcher extends Matcher {
     const hybrid = await this.buildHybridCandidates(
       context,
       requestEmbedding,
-      retainedHits,
+      currentHits,
       primary
     );
     return hybrid.length > 0 ? hybrid : primary;
@@ -938,12 +972,27 @@ export class TransformerMatcher extends Matcher {
   }
 
   private aggregateAnnTagHits(
-    tagHits: Array<{ campaignId: string; similarity: number }>
-  ): Array<{ campaignId: string; retrievalScore: number }> {
-    const grouped = new Map<string, number[]>();
+    tagHits: Array<{
+      campaignId: string;
+      servingVersion?: number;
+      similarity: number;
+    }>
+  ): Array<{
+    campaignId: string;
+    servingVersions: number[];
+    retrievalScore: number;
+  }> {
+    const grouped = new Map<
+      string,
+      { similarities: number[]; servingVersions: Set<number> }
+    >();
 
     for (const hit of tagHits) {
-      const bucket = grouped.get(hit.campaignId) ?? [];
+      const group = grouped.get(hit.campaignId) ?? {
+        similarities: [],
+        servingVersions: new Set<number>(),
+      };
+      const bucket = group.similarities;
       if (bucket.length < this.annMaxTagHitsPerCampaign) {
         bucket.push(hit.similarity);
       } else {
@@ -953,11 +1002,15 @@ export class TransformerMatcher extends Matcher {
           bucket[minIndex] = hit.similarity;
         }
       }
-      grouped.set(hit.campaignId, bucket);
+      if (Number.isFinite(hit.servingVersion)) {
+        group.servingVersions.add(hit.servingVersion!);
+      }
+      grouped.set(hit.campaignId, group);
     }
 
     return [...grouped.entries()]
-      .map(([campaignId, similarities]) => {
+      .map(([campaignId, group]) => {
+        const similarities = group.similarities;
         const sorted = [...similarities].sort((a, b) => b - a);
         const topWeighted = this.computeTopWeightedSimilarity(sorted);
         const coverage = this.clamp01(
@@ -967,9 +1020,23 @@ export class TransformerMatcher extends Matcher {
           topWeighted * 0.85 + coverage * 0.15
         );
 
-        return { campaignId, retrievalScore };
+        return {
+          campaignId,
+          servingVersions: [...group.servingVersions],
+          retrievalScore,
+        };
       })
       .sort((a, b) => b.retrievalScore - a.retrievalScore);
+  }
+
+  private matchesHitVersion(
+    hit: { servingVersion?: number },
+    campaign: ServingCampaign
+  ): boolean {
+    return (
+      !Number.isFinite(hit.servingVersion) ||
+      hit.servingVersion === campaign.servingVersion
+    );
   }
 
   private computeTopWeightedSimilarity(similarities: number[]): number {
