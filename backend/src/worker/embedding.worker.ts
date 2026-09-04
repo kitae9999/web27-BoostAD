@@ -145,29 +145,16 @@ export class EmbeddingWorker
       return;
     }
 
-    if (!campaign.tags || campaign.tags.length === 0) {
-      this.logger.warn(`Campaign ${job.campaignId}에 태그가 없습니다.`);
-      return;
-    }
-
-    // 2. E5 retrieval 계약에 따라 캠페인은 passage로 생성한다.
-    const embeddingTags: { [tagName: string]: number[] } = {};
-
-    for (const tagName of campaign.tags) {
-      const embedding = await this.mlEngine.getEmbedding(tagName, 'passage');
-      embeddingTags[tagName] = embedding;
-    }
-
+    // 2. E5 retrieval 계약에 따라 캠페인 문서를 passage로 생성한다.
     const document = await this.mlEngine.getEmbedding(
       buildCampaignDocumentText(campaign),
       'passage'
     );
 
-    // 3. model version, document, tag vector를 한 번에 publish한다.
+    // 3. model version과 document vector를 한 번에 publish한다.
     const payload = {
       modelVersion: this.mlEngine.getModelVersion(),
       document,
-      tags: embeddingTags,
     };
 
     if (versioned) {
@@ -195,7 +182,7 @@ export class EmbeddingWorker
     }
 
     this.logger.log(
-      `✅ ID:${job.campaignId.slice(0, 8)}... title:${campaign.title.slice(0, 15)}... 임베딩 생성 완료 (${campaign.tags.length}개 태그)`
+      `✅ ID:${job.campaignId.slice(0, 8)}... title:${campaign.title.slice(0, 15)}... 문서 임베딩 생성 완료`
     );
   }
 }

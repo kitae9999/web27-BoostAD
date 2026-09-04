@@ -29,12 +29,10 @@ export const REDIS_APPLY_SEARCH_PROJECTION_SCRIPT = `
     and existing.indexReady == true
 
   if reusable then
-    incoming.embeddingTags = existing.embeddingTags
     incoming.embeddingDocument = existing.embeddingDocument
     incoming.embeddingModelVersion = existing.embeddingModelVersion
     incoming.indexReady = true
   else
-    incoming.embeddingTags = nil
     incoming.embeddingDocument = nil
     incoming.embeddingModelVersion = nil
     incoming.indexReady = false
@@ -78,7 +76,6 @@ export const REDIS_APPLY_SEARCH_EMBEDDING_SCRIPT = `
   if tonumber(campaign.servingVersion) ~= expectedVersion then return 0 end
   if campaign.semanticHash ~= ARGV[2] then return 0 end
   local embedding = cjson.decode(ARGV[3])
-  campaign.embeddingTags = embedding.tags
   campaign.embeddingDocument = embedding.document
   campaign.embeddingModelVersion = embedding.modelVersion
   campaign.indexReady = true

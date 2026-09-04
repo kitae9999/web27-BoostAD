@@ -1,9 +1,8 @@
 import type {
   CampaignDocumentVectorSearchHit,
+  CampaignDocumentVectorSearchOptions,
   CampaignEmbeddingPayload,
   SearchCampaign,
-  CampaignTagVectorSearchHit,
-  CampaignTagVectorSearchOptions,
 } from '../types/campaign.types';
 import type {
   CampaignProjectionDocument,
@@ -27,11 +26,8 @@ export abstract class CampaignSearchRepository {
     semanticHash: string,
     payload: CampaignEmbeddingPayload
   ): Promise<boolean>;
-  abstract searchCampaignTagVectors(
-    options: CampaignTagVectorSearchOptions
-  ): Promise<CampaignTagVectorSearchHit[]>;
   abstract searchCampaignDocumentVectors(
-    options: CampaignTagVectorSearchOptions
+    options: CampaignDocumentVectorSearchOptions
   ): Promise<CampaignDocumentVectorSearchHit[]>;
   abstract appendSnapshotEvent(event: SearchSnapshotEvent): Promise<string>;
 }

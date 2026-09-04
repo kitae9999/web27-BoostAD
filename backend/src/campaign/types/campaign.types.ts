@@ -75,9 +75,6 @@ export type CachedCampaign = {
   // 태그 정보 (매칭용)
   tags?: string[];
 
-  // 태그별 임베딩 (Worker가 추가)
-  embeddingTags?: { [tagName: string]: number[] };
-
   // 서로 다른 모델의 384차원 벡터를 혼용하지 않기 위한 namespace
   embeddingModelVersion?: string;
 
@@ -107,7 +104,6 @@ export type SearchCampaign = {
   createdAt: string;
   deletedAt: string | null;
   tags: string[];
-  embeddingTags?: { [tagName: string]: number[] };
   embeddingModelVersion?: string;
   embeddingDocument?: number[];
 };
@@ -115,7 +111,6 @@ export type SearchCampaign = {
 export type CampaignEmbeddingPayload = {
   modelVersion: string;
   document: number[];
-  tags: { [tagName: string]: number[] };
 };
 
 export type CachedCampaignWithoutSpent = Omit<
@@ -127,19 +122,11 @@ export type CachedCampaignWithoutSpent = Omit<
   | 'dailyReservedDate'
 >;
 
-export type CampaignTagVectorSearchOptions = {
+export type CampaignDocumentVectorSearchOptions = {
   queryEmbedding: number[];
   topL: number;
   isHighIntent: boolean;
   nowTs: number;
-};
-
-export type CampaignTagVectorSearchHit = {
-  campaignId: string;
-  servingVersion: number;
-  tagName: string;
-  distance: number;
-  similarity: number;
 };
 
 export type CampaignDocumentVectorSearchHit = {

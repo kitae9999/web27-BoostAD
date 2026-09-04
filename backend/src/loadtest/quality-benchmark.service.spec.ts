@@ -28,7 +28,8 @@ function campaign(id: string): CachedCampaign {
     createdAt: '2026-07-10T00:00:00.000Z',
     deletedAt: null,
     tags: ['react'],
-    embeddingTags: { react: [1, 0] },
+    embeddingDocument: [1, 0],
+    embeddingModelVersion: 'quality-model-v1',
   };
 }
 
@@ -40,7 +41,6 @@ describe('QualityBenchmarkService', () => {
     deleteCampaignCacheById: jest.Mock;
     saveCampaignCacheById: jest.Mock;
     findCampaignCachesByIds: jest.Mock;
-    searchCampaignTagVectors: jest.Mock;
     searchCampaignDocumentVectors: jest.Mock;
     reserveAuction: jest.Mock;
   };
@@ -56,30 +56,17 @@ describe('QualityBenchmarkService', () => {
   beforeEach(() => {
     state = [campaign('existing-campaign')];
     repository = {
-      getAllCampaigns: jest.fn(async () => [...state]),
-      deleteCampaignCacheById: jest.fn(async (id: string) => {
+      getAllCampaigns: jest.fn(() => Promise.resolve([...state])),
+      deleteCampaignCacheById: jest.fn((id: string) => {
         state = state.filter((item) => item.id !== id);
+        return Promise.resolve();
       }),
-      saveCampaignCacheById: jest.fn(
-        async (_id: string, item: CachedCampaign) => {
-          state = [
-            ...state.filter((existing) => existing.id !== item.id),
-            item,
-          ];
-        }
-      ),
-      findCampaignCachesByIds: jest.fn(async (ids: string[]) =>
-        state.filter((item) => ids.includes(item.id))
-      ),
-      searchCampaignTagVectors: jest.fn(async () =>
-        state.flatMap((item) =>
-          (item.tags ?? []).map((tagName) => ({
-            campaignId: item.id,
-            tagName,
-            distance: 0,
-            similarity: 1,
-          }))
-        )
+      saveCampaignCacheById: jest.fn((_id: string, item: CachedCampaign) => {
+        state = [...state.filter((existing) => existing.id !== item.id), item];
+        return Promise.resolve();
+      }),
+      findCampaignCachesByIds: jest.fn((ids: string[]) =>
+        Promise.resolve(state.filter((item) => ids.includes(item.id)))
       ),
       searchCampaignDocumentVectors: jest.fn(() =>
         Promise.resolve(
@@ -99,8 +86,8 @@ describe('QualityBenchmarkService', () => {
         score: 86,
       }));
     matcher = {
-      matchCandidates: jest.fn(async () => scored()),
-      findQualityRankings: jest.fn(async () => scored()),
+      matchCandidates: jest.fn(() => Promise.resolve(scored())),
+      findQualityRankings: jest.fn(() => Promise.resolve(scored())),
     };
     contextEmbeddingService = {
       completeJob: jest.fn().mockResolvedValue(undefined),
@@ -111,7 +98,6 @@ describe('QualityBenchmarkService', () => {
         const values: Record<string, string> = {
           LOADTEST_RESET_ENABLED: 'true',
           LOADTEST_RESET_TOKEN: 'secret',
-          RTB_MATCHER_ANN_ENABLED: 'true',
           RTB_CONTEXT_DECISION_ENABLED: 'true',
           RTB_CAMPAIGN_SOURCE: 'local_snapshot',
         };
@@ -124,7 +110,7 @@ describe('QualityBenchmarkService', () => {
       getModelId: jest.fn(() => 'test/model'),
       getModelVersion: jest.fn(() => 'quality-model-v1'),
       getEmbeddingDimension: jest.fn(() => 2),
-      getEmbedding: jest.fn(async () => [1, 0]),
+      getEmbedding: jest.fn(() => Promise.resolve([1, 0])),
     };
 
     service = new QualityBenchmarkService(
@@ -172,7 +158,6 @@ describe('QualityBenchmarkService', () => {
     const sessionId = loaded.sessionId;
 
     expect(state.map((item) => item.id)).toEqual(['q4-frontend-guide']);
-    expect(state[0].embeddingTags?.react).toEqual([1, 0]);
     expect(state[0].embeddingDocument).toEqual([1, 0]);
     expect(state[0].embeddingModelVersion).toBe('quality-model-v1');
     expect(loaded.runtime).toMatchObject({
@@ -233,9 +218,9 @@ describe('QualityBenchmarkService', () => {
 
   it('fails extraction when matcher-side behavior mutates campaign budget', async () => {
     const sessionId = await loadQualitySession();
-    matcher.findQualityRankings.mockImplementationOnce(async () => {
+    matcher.findQualityRankings.mockImplementationOnce(() => {
       state[0] = { ...state[0], dailySpent: 100, totalSpent: 100 };
-      return [{ ...state[0], similarity: 0.8, score: 86 }];
+      return Promise.resolve([{ ...state[0], similarity: 0.8, score: 86 }]);
     });
 
     await expect(

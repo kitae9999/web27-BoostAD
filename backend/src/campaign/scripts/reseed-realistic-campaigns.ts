@@ -615,16 +615,6 @@ function pickOne<T>(items: T[], rng: () => number): T {
   return items[Math.floor(rng() * items.length)];
 }
 
-function pickUnique<T>(items: T[], count: number, rng: () => number): T[] {
-  const pool = [...items];
-  for (let index = pool.length - 1; index > 0; index -= 1) {
-    const swapIndex = Math.floor(rng() * (index + 1));
-    [pool[index], pool[swapIndex]] = [pool[swapIndex], pool[index]];
-  }
-
-  return pool.slice(0, Math.min(count, pool.length));
-}
-
 function clampText(text: string, maxLength: number): string {
   return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
 }
@@ -1264,7 +1254,7 @@ async function reseedCampaigns(): Promise<void> {
       '- backend 프로세스가 이미 떠 있었다면 in-memory allCampaigns cache가 최대 10초간 남을 수 있습니다.'
     );
     console.log(
-      '- worker가 떠 있어야 embeddingTags가 채워지고 RTB match path가 정상 동작합니다.'
+      '- worker가 떠 있어야 embeddingDocument가 채워지고 RTB match path가 정상 동작합니다.'
     );
   } finally {
     await dataSource.destroy();

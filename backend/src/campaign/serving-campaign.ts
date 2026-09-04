@@ -24,7 +24,6 @@ export type ServingCampaign = {
   endDate: string;
   deletedAt: string | null;
   tags?: string[];
-  embeddingTags?: Record<string, Float32Array>;
   embeddingModelVersion?: string;
   embeddingDocument?: Float32Array;
 };
@@ -36,14 +35,6 @@ export type ServingCampaign = {
 export function toServingCampaign(
   campaign: CachedCampaign | SearchCampaign
 ): ServingCampaign {
-  const embeddingTags = campaign.embeddingTags
-    ? Object.fromEntries(
-        Object.entries(campaign.embeddingTags).map(([tagName, vector]) => [
-          tagName,
-          new Float32Array(vector),
-        ])
-      )
-    : undefined;
   const embeddingDocument = campaign.embeddingDocument
     ? new Float32Array(campaign.embeddingDocument)
     : undefined;
@@ -64,7 +55,6 @@ export function toServingCampaign(
     endDate: campaign.endDate,
     deletedAt: campaign.deletedAt,
     tags: campaign.tags ? [...campaign.tags] : undefined,
-    embeddingTags,
     embeddingModelVersion: campaign.embeddingModelVersion,
     embeddingDocument,
   };
